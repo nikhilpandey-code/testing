@@ -7,7 +7,7 @@ def sum_of_two_arrays(arr1, arr2):
     for i in range(max(len(arr1), len(arr2))):
         a = arr1[i] if i < len(arr1) else 0
         b = arr2[i] if i < len(arr2) else 0
-        result.append(a - b)
+        result.append(a + b)
     return result
 
 
