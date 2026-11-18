@@ -1,0 +1,298 @@
+LAYA GOTCHAS AND UPSTREAM ISSUES
+================================
+Every trap found while checking the Laya code (version 0.3.20, checked 2026-11-18), with
+the evidence, the impact, what we should do, and, where it fits, a suggested fix to send
+to the Laya project. Line numbers refer to files under laya/ in this repository.
+
+Nothing has been reported upstream. Filing issues or pull requests is outward-facing and
+should be our decision; section C has draft texts ready.
+
+
+A. GOTCHAS THAT AFFECT CORRECTNESS
+==================================
+
+A1. `confidence` is not the calibrated number for choice and score
+------------------------------------------------------------------
+Evidence: laya/agent.py _decode_answers (from line 653). For choice and score,
+"confidence" = 1 - normalised entropy (confidence_from_probs); "answer_confidence" = top
+probability (answer_confidence). The code comment says only answer_confidence is what
+temperature scaling fits and what ECE measures. For noul both are the same.
+Places that use the uncalibrated field:
+  - README.md:573, the "Automated Confidence Gating" example (threshold 0.85 on `confidence`)
+  - laya/integrations/langchain.py:245, LayaRouter's confidence_threshold
+  - laya/integrations/langchain.py:448, LayaTriage's intent_confidence
+  - laya/structured.py:210, decide(..., return_details=True) -> DecisionResult.confidence,
+    although docs/structured.md calls it "calibrated confidence"
+Impact: a threshold of 0.85 on `confidence` does not mean "85% likely right". With many
+options the entropy value can be low while the top answer is very likely, or the reverse,
+so automation rates and error rates differ from what the threshold suggests.
+What we do: always gate on answers[qid]["answer_confidence"]. For LayaRouter and
+DecisionResult, read answer_confidence from the raw answers instead of their confidence.
+
+A2. The shipped checkpoints are over-confident; multilingual has no fitted temperatures
+--------------------------------------------------------------------------------------
+Evidence: README Calibration: ECE 0.466 (english) and 0.314 (multilingual) as shipped;
+0.081 and 0.106 after a refit. The shipped "choice:11+" temperature is 0.1006 and is
+clamped to 0.5 at load (laya/common.py, comment above TEMP_MIN).
+What we do: fit temperatures on our labelled data before trusting any probability
+("laya evaluation plan.txt", section 7).
+
+A3. Base checkpoints are weak zero-shot on business workflows
+-------------------------------------------------------------
+Evidence: typed-decisions 0.362 / 0.352 (below the 0.461 majority baseline); Chinese
+workplace benchmark 20/64 vs Jev 64/64 with 22 false task assignments out of 32.
+What we do: never ship an untuned checkpoint for a business decision without measuring it;
+plan for fine-tuning.
+
+A4. act_probability carries no signal
+-------------------------------------
+Evidence: README.md:954 (issue #185: reads ~1.0, AUROC 0.30). In the fine-tuning
+notebook's train_ddp.py the act head is in the loss only as 0.0 * act.sum(), so it gets
+no gradient during fine-tuning.
+What we do: ignore answers[qid]["action"]["act_probability"].
+
+A5. Never send non-English text to the English checkpoint
+---------------------------------------------------------
+Evidence: README/BENCHMARKS: Khmer 0.000 accuracy at 0.952 confidence; Hindi 0.100 on a
+20-option task. Confidence stays high, so gating cannot catch it.
+What we do: let the Router decide, or pass lang=; never force model="english" on mixed
+traffic; check routing in our evaluation.
+
+A6. Short Latin-script text defaults to English
+-----------------------------------------------
+Evidence: laya/lang.py needs 4+ words and holds word lists for only 10 languages (en, fr,
+de, es, pt, it, nl, ro, bn, az). "Quero cancelar" or "Esqueci minha senha" go to `default`,
+which is "english" (README; laya/router.py _route).
+What we do: if much traffic is non-English, use Router(default="multilingual"), pass
+lang= when the source knows the language, or plug in a detector with lang_guess=.
+
+A7. Label words can override meaning
+------------------------------------
+Evidence: README Honest limits and issue #156. Choice keys like true/false/yes/no can
+dominate; noul on the English checkpoint can follow its "false:"/"true:" labels and return
+a confident "no" for clearly positive text.
+What we do: meaningful choice keys or neutral "A"/"B"; for noul use the labels mapping or a
+two-option choice ("laya question design guide.txt").
+
+A8. noul criteria keys are restricted
+-------------------------------------
+Evidence: laya/agent.py _check_question: noul criteria may only use "true"/"false".
+Before a fix, other keys were silently dropped (issue #156); now they raise an error.
+What we do: key noul criteria "true"/"false"; change wording with labels.
+
+A9. Score questions: weakest type and a first-level bias
+--------------------------------------------------------
+Evidence: SST-5 0.372 (README); issue #131: the multilingual checkpoint rarely picks
+level 0. answers[qid]["score"] is an expected value, while decide() returns the argmax
+level (laya/structured.py _project), so the two can differ.
+What we do: prefer choice for categories; validate score on our data; pick one reading
+(expected value or argmax) and use it consistently.
+
+A10. Too many options
+--------------------
+Evidence: options share head_max_len (192 / 256 tokens); 77 options get about 3 to 4
+tokens each (Banking77 0.425 vs Jev 0.870). If the options do not fit within max_len,
+predict raises "options exceed head_max_len".
+What we do: about 20 options or fewer per question; otherwise raise the budget, use
+predict_shortlist, or split the question.
+
+A11. Option order changes answers at 20 options
+----------------------------------------------
+Evidence: BENCHMARKS.md: answer changes on 15% (english) and 23% (multilingual) of
+MASSIVE intent cases when options are shuffled; Jev 13%.
+What we do: keep option order fixed between training, evaluation and production; test
+shuffles when designing questions.
+
+A12. Truncation direction depends on the state type
+---------------------------------------------------
+Evidence: laya/agent.py _encode_state: strings and dicts keep the start; lists keep the
+end. State budget is about 320 tokens on the English checkpoint.
+What we do: put key content first in strings and dicts; pass conversations as lists,
+oldest first; use multilingual with max_len for long documents.
+
+A13. decide() booleans use a fixed 0.5 threshold
+------------------------------------------------
+Evidence: laya/structured.py _project: True when P(true) >= 0.5.
+What we do: for costly actions, use the raw answers and our own threshold.
+
+A14. Small numeric differences between batch shapes
+---------------------------------------------------
+Evidence: README: changing batch shapes (predict_batch, sort_by_length) can cause small
+floating-point differences, including near decision thresholds; MPS uses fp16 only for 5+
+rows; CPU bf16 is opt-in (LAYA_CPU_AMP).
+What we do: do not rely on exact probabilities near a threshold; evaluate with the same
+batch settings as production.
+
+A15. Email cleaning covers three languages
+------------------------------------------
+Evidence: laya/email.py: markers for English, Portuguese and Spanish mail clients only;
+body capped at 3,000 characters.
+What we do: check cleaning on our main email languages; otherwise strip quoted history
+ourselves.
+
+A16. Weak areas by task
+-----------------------
+Moderation 0.530 on held-out toxic-chat; jailbreak guardrails 0.708 to 0.762; support
+triage 0.50 to 0.52 even though it was in training. Spam and phishing 0.98 to 0.99 but in
+training. Validate on our traffic before using any preset.
+
+
+B. GOTCHAS IN SERVING AND OPERATIONS
+====================================
+
+B1. laya-serve binds all interfaces with no authentication by default
+--------------------------------------------------------------------
+Evidence: laya/serve.py:293 (LAYA_HOST default "0.0.0.0"); LAYA_API_KEY unset means no
+check. (Docker Compose publishes on 127.0.0.1; the NixOS module binds 127.0.0.1.)
+What we do: always set LAYA_API_KEY; bind to localhost or a private network; TLS proxy.
+
+B2. One prediction at a time per server
+---------------------------------------
+Evidence: laya/serve.py create_app: ThreadPoolExecutor(max_workers=1) plus an asyncio lock.
+What we do: size with replicas; use in-process batching for bulk jobs.
+
+B3. /health reports the configured device, not the real one
+-----------------------------------------------------------
+Evidence: laya/serve.py:237 returns os.environ LAYA_DEVICE or "auto". The Agent silently
+falls back to CPU when the GPU is unavailable or out of memory (laya/agent.py, load and
+_infer).
+What we do: log Agent.device in an on_load hook; alert on latency.
+
+B4. GPU out-of-memory falls back to CPU with only a print()
+-----------------------------------------------------------
+Evidence: laya/agent.py:628 print("Warning: GPU memory exceeded during inference. Falling
+back to CPU..."); the agent then stays on CPU. Load-time fallback also uses print.
+Impact: 10 to 15 times slower from then on, easy to miss in logs that capture only the
+logging module.
+What we do: capture stdout in production logs; monitor latency; restart on fallback.
+
+B5. Compose defaults differ from laya-serve defaults
+----------------------------------------------------
+Evidence: compose.http.yaml sets LAYA_PRELOAD=0 (lazy) and LAYA_DEVICE=cpu; pip laya-serve
+defaults to preload=1 and auto device.
+What we do: set LAYA_PRELOAD=1 and LAYA_MODELS explicitly in production.
+
+B6. No setting to serve a custom checkpoint path
+------------------------------------------------
+Evidence: laya/serve.py build_router builds Router() with the default models only.
+What we do: use the small launcher with create_app(router) ("laya deployment guide.txt",
+section 7).
+
+B7. LangChain thresholds and guardrails
+---------------------------------------
+  - LayaRouter falls back based on the entropy-based `confidence` (see A1).
+  - LayaGuardrail uses ONE threshold (default 0.5) for two different scales
+    (laya/integrations/langchain.py, invoke, around lines 338-346): a noul question is
+    flagged when P(true) >= 0.5, and a score question when its EXPECTED LEVEL >= 0.5. The
+    default guard preset's harm_severity has four levels (0 none, 1 minor, 2 serious,
+    3 severe), so any prompt whose expected harm is halfway between "none" and "minor" is
+    blocked. Since probabilities rarely put all their mass on level 0 (and the multilingual
+    checkpoint seldom picks level 0 at all, issue #131), this can block many harmless
+    prompts. This follows from reading the code; we have not measured how often it happens.
+  - The "topic" choice question in the guard preset never triggers a violation; it is only
+    returned.
+What we do: pass our own questions to LayaGuardrail, or check flagged results ourselves
+with separate thresholds per question (for harm_severity, e.g. the probability of levels
+2 and 3, not the expected level).
+
+
+C. DOCUMENTATION MISMATCHES (candidates to report upstream)
+===========================================================
+
+C1. README says the notebook calibrates on training items; it does not
+---------------------------------------------------------------------
+Evidence: README.md:1000 says "The notebook's calibration samples come from its training
+items". The notebook's train_ddp.py holds out min(400, 10%) of items with a fixed seed
+before training and fits on those.
+
+C2. Fine-tuning runtime conflict
+--------------------------------
+Evidence: README.md:1011 "roughly 4-5 hours for 4 epochs over ~30k questions"; the
+notebook's own cell says "~4 to 6 minutes total" for its 6,000 decisions.
+
+C3. The laya[structured] extra does not exist
+---------------------------------------------
+Evidence: README.md:631 and docs/structured.md:25 say install laya[structured];
+pyproject.toml defines serve, fast, mcp, onnx, langchain, langgraph only. pip warns that
+the extra is not provided and installs without pydantic.
+What we do: pip install pydantic separately.
+
+C4. "Calibrated confidence" in the structured docs
+--------------------------------------------------
+Evidence: docs/structured.md promises calibrated confidence; DecisionResult.confidence is
+the entropy-based field (A1).
+
+C5. Notebook temperature range vs runtime clamp
+-----------------------------------------------
+Evidence: the notebook clamps fitted temperatures to 0.1..10; the runtime clamps to
+0.5..5.0 (laya/common.py) and warns. A fit outside 0.5..5.0 is not used as fitted.
+
+C6. Notebook pushes to the maintainer's repository by default
+-------------------------------------------------------------
+Evidence: notebook cell 16: NEW_REPO = "convaiinnovations/laya-typed-decisions". Anyone
+running it unchanged targets that repository (it fails without permission, but the intent
+is surely "your own repo").
+
+C7. Multilingual benchmark numbers no longer reproduce exactly
+--------------------------------------------------------------
+Evidence: research/eval/README.md: the independent harness reproduces the english
+checkpoint's 51 languages exactly, but 45 of 51 multilingual accuracies differ from the
+committed sweep (macro 0.3661 committed vs 0.4008 re-measured); the cause is not found.
+Impact: treat per-language multilingual numbers as approximate.
+
+C8. The paired Chinese results are archived, not current
+--------------------------------------------------------
+Evidence: research/benchmarks/feishu_zh/README.md: archived 2026-09-21 results, "not
+scores for the current main branch".
+
+
+D. IN OUR OWN REPOSITORY
+========================
+  - The commit "Claude understanding about laya" added a macOS .DS_Store file. Suggest
+    removing it and adding .DS_Store to a top-level .gitignore (laya/.gitignore exists but
+    does not cover the parent folder). I have not changed this.
+  - None of our notes files are in the Laya package; they live beside it.
+
+
+E. DRAFT ISSUE TEXTS FOR THE LAYA PROJECT (not filed)
+=====================================================
+These follow AGENTS.md (English, focused, with evidence). We would need to decide whether
+to file them, and check that they are not already reported.
+
+E1. "Gating example and LayaRouter use the uncalibrated `confidence` field"
+  The README's Automated Confidence Gating example (README.md:573) and LayaRouter's
+  confidence_threshold (laya/integrations/langchain.py:245) compare against
+  answers[qid]["confidence"], which for choice and score is 1 - normalised entropy.
+  _decode_answers documents answer_confidence (max p) as the calibrated quantity that
+  temperature scaling fits and ECE measures. LayaTriage's intent_confidence (line 448) and
+  DecisionResult.confidence (laya/structured.py:210) do the same. Suggest: switch these to
+  answer_confidence (or document the difference), and update docs/structured.md.
+
+E2. "README describes notebook calibration and runtime inaccurately"
+  README.md:1000 says the notebook calibrates on training items, but train_ddp.py holds
+  out min(400, 10%) items before training. README.md:1011 gives 4-5 hours for ~30k
+  questions, while the notebook says ~4-6 minutes for 6,000 decisions. Suggest updating
+  both statements.
+
+E3. "laya[structured] extra referenced but not defined"
+  README.md:631 and docs/structured.md:25 tell users to install laya[structured], but
+  pyproject.toml has no such extra. Suggest adding structured = ["pydantic>=2"] or
+  changing the docs to "pip install pydantic".
+
+E4. "/health reports configured device, not the device in use"
+  laya/serve.py:237 returns LAYA_DEVICE, while Agent can fall back to CPU at load or after
+  an out-of-memory error. Suggest reporting each loaded Agent's device (the MCP server
+  already distinguishes these in laya/mcp/device.py), and emitting the fallback through
+  warnings or logging rather than print.
+
+E5. "LayaGuardrail applies one threshold to probabilities and expected score levels"
+  LayaGuardrail.invoke flags noul answers when P(true) >= threshold and score answers when
+  the expected level >= threshold, with one shared default of 0.5. On the default
+  guard_questions() preset, harm_severity (levels 0-3) is then flagged at an expected
+  level of 0.5. Suggest a per-question threshold, or flagging score questions on the
+  probability of the upper levels.
+
+E6. "Notebook default push target and temperature range"
+  Cell 16 pushes to convaiinnovations/laya-typed-decisions by default; suggest a
+  placeholder. The fit clamps to 0.1..10 while the runtime clamps to 0.5..5; suggest
+  matching the runtime range.

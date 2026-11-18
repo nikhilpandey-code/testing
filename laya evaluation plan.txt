@@ -1,0 +1,257 @@
+LAYA EVALUATION PLAN
+====================
+A concrete plan to decide, with our own data, whether Laya should handle a workflow, and
+in which form (untuned, recalibrated, or fine-tuned), compared with our current method and,
+optionally, TypeSafe Jev or an LLM. The code sketches below follow the real APIs in
+laya/agent.py, laya/router.py and laya/common.py but have NOT been run; treat them as a
+starting point.
+
+hey all good??
+
+1. The questions this plan answers
+----------------------------------
+  Q1. How accurate is Laya on our workflow, as shipped?
+  Q2. Can we trust its probabilities enough to automate above a threshold?
+  Q3. How much do temperature fitting and fine-tuning improve it?
+  Q4. Is it better than what we use today (and than Jev or an LLM)?
+  Q5. What does it cost and how fast is it on the hardware we would really use?
+
+Expectation from the repository (so we are not surprised): untuned checkpoints are weak on
+new business workflows (typed-decisions 0.362; paired Chinese workplace test 20/64 vs Jev
+64/64). Fine-tuning is where the gains are (0.766 on typed-decisions).
+
+
+2. Choose one workflow
+----------------------
+Pick one with: a fixed set of answers, enough traffic to collect examples, and a clear
+cost of mistakes. Support triage (department, urgency, refund, churn) is a good first
+candidate. Write the questions with "laya question design guide.txt" and freeze them: the
+same question set is used by every system and every split.
+
+Write down the cost of each error type before measuring, for example:
+  - false action (we act when we should not): e.g. wrongly auto-refunding
+  - missed action (we do not act when we should): e.g. an urgent ticket left in the queue
+The Chinese workplace benchmark in the repository counts exactly these two, because
+accuracy alone hides them.
+
+
+3. Build the labelled data
+--------------------------
+Format (one JSON object per line, file test.jsonl and so on):
+
+  {"id": "t-0001",
+   "state": {"subject": "...", "body": "..."},
+   "gold": {"department": "billing", "urgency": 2, "refund_requested": true}}
+
+  - gold for choice: the label key; for score: the level index (0-based); for noul: true or
+    false.
+  - Take examples from real traffic over several weeks, not one day. Include each language
+    we serve and the hard cases (sarcasm, two topics in one message, very short messages).
+  - Remove or mask personal data if the data leaves its normal system.
+  - Two people label the same 100 examples and we measure agreement. If humans agree only
+    80% of the time, no model will reliably exceed that, and the questions may need
+    rewording.
+
+How many examples (worst-case 95% margin of error on an accuracy figure):
+      test set    margin
+      100         +/- 9.8 points
+      200         +/- 6.9
+      400         +/- 4.9
+      1,000       +/- 3.1
+  With 200 test examples, 0.72 vs 0.76 is not a real difference. Aim for at least 400 test
+  examples for a decision, more for rare classes.
+
+Splits:
+      train        for fine-tuning only (system C below), e.g. 60%
+      calibration  for fitting temperatures (systems B and C), e.g. 20%
+      test         touched once, at the end, by every system, e.g. 20%
+  Never tune questions, thresholds or temperatures on the test set.
+
+
+4. The systems to compare
+-------------------------
+  A. Laya Router, as shipped.                         (Q1)
+  B. A plus temperatures fitted on the calibration split.   (Q2)
+  C. Laya fine-tuned on the train split ("laya fine-tuning guide.txt"), temperatures from
+     the notebook's held-out slice or refitted on our calibration split.   (Q3)
+  D. Our current method (rules, people, or an LLM).   (Q4)
+  E. Optional: TypeSafe Jev (billable API, and data leaves our network: check that it is
+     allowed) or a hosted LLM.   (Q4)
+
+
+5. Metrics
+----------
+Per question and overall:
+  - accuracy, and macro-F1 (so small classes count)
+  - per-class recall, and a confusion matrix
+  - false actions and missed actions, weighted by the costs from section 2
+  - calibration: ECE on answer_confidence, using laya.ece_score(conf, correct) (15 bins,
+    the same metric as every number in the repository)
+  - automation curve: for thresholds 0.5 .. 0.95, the share of cases above the threshold
+    ("automation rate") and the accuracy on those cases. This is the number the business
+    cares about: "at 90% accuracy we can automate X% of tickets".
+  - latency p50 and p95 on the real target hardware, and throughput with batching
+  - cost per 1,000 decisions (hardware time for Laya; API price for Jev or an LLM)
+
+Use answer_confidence, never the `confidence` field, for ECE and thresholds. For choice and
+score questions `confidence` is an entropy measure and is not calibrated.
+
+
+6. Script sketch: run Laya on a split and record every case
+-----------------------------------------------------------
+  # eval_laya.py  (sketch; not run)
+  import json, time
+  import numpy as np
+  from laya import Router, ece_score
+
+  QUESTIONS = json.load(open("questions.json"))          # the frozen question set
+  cases = [json.loads(line) for line in open("test.jsonl")]
+
+  router = Router(preload=True)
+  # fine-tuned: Router(models={"english": "/path/to/our_model"}, preload=True)
+
+  records, latencies = [], []
+  for case in cases:
+      t0 = time.perf_counter()
+      res = router.predict(case["state"], QUESTIONS)
+      latencies.append((time.perf_counter() - t0) * 1000)
+      for qid, gold in case["gold"].items():
+          a = res["answers"][qid]
+          if a["type"] == "choice":
+              pred = a["choice"]
+              probs = [a["probabilities"][k] for k in QUESTIONS[qid]["criteria"]]
+              gold_idx = list(QUESTIONS[qid]["criteria"]).index(gold)
+          elif a["type"] == "noul":
+              pred = a["noul"] >= 0.5
+              probs = [1 - a["noul"], a["noul"]]
+              gold_idx = int(bool(gold))
+          else:  # score
+              probs = [a["probabilities"][str(i)] for i in range(len(QUESTIONS[qid]["criteria"]))]
+              pred = int(np.argmax(probs))
+              gold_idx = int(gold)
+          records.append({"id": case["id"], "qid": qid, "type": a["type"], "gold": gold,
+                          "pred": pred, "correct": pred == gold,
+                          "conf": a["answer_confidence"], "probs": probs, "gold_idx": gold_idx,
+                          "model": res["routing"]["model"]})
+
+  json.dump(records, open("records_test.json", "w"), indent=1, default=str)
+
+  ok = np.array([r["correct"] for r in records], dtype=float)
+  conf = np.array([r["conf"] for r in records])
+  print("accuracy %.3f  ECE %.3f" % (ok.mean(), ece_score(conf, ok)))
+  print("latency p50 %.0f ms  p95 %.0f ms" % tuple(np.percentile(latencies, [50, 95])))
+  for t in (0.5, 0.6, 0.7, 0.8, 0.9, 0.95):
+      sel = conf >= t
+      if sel.any():
+          print("threshold %.2f: automate %.0f%%, accuracy %.3f" % (t, 100 * sel.mean(), ok[sel].mean()))
+
+Notes:
+  - If choice criteria are given as a list, use the list instead of the dict keys.
+  - Run the same script per question too (filter records by qid); one weak question can
+    hide behind good averages.
+  - Record res["routing"]["model"]: a wrong route (e.g. short Portuguese sent to english)
+    shows up here.
+  - For throughput, also time router.predict_batch over the whole split.
+
+
+7. Script sketch: fit temperatures (system B)
+---------------------------------------------
+The API returns probabilities, not logits, but that is enough. Because
+p = softmax(z / T_old), we have log p = z / T_old + constant, so softmax(a * log p) equals the
+model's output with temperature T_new = T_old / a. Find the a that minimises the negative log
+likelihood on the calibration split, separately for each (question type, option-count bucket):
+
+  # fit_temps.py  (sketch; not run)
+  import numpy as np
+
+  def fit_scale(prob_rows, gold_idx):
+      best_a, best_nll = 1.0, float("inf")
+      for a in np.exp(np.linspace(np.log(0.2), np.log(5.0), 200)):
+          nll = 0.0
+          for p, g in zip(prob_rows, gold_idx):
+              z = a * np.log(np.clip(np.asarray(p, dtype=float), 1e-6, 1.0))
+              z -= z.max()
+              q = np.exp(z) / np.exp(z).sum()
+              nll -= np.log(max(q[g], 1e-12))
+          if nll < best_nll:
+              best_a, best_nll = a, nll
+      return best_a
+
+  # records_cal = records from running eval_laya.py on calibration.jsonl
+  # group by bucket: type + option count -> "choice:3-5", "noul:2", "score:3-5", ...
+  # then for each bucket:
+  #     a = fit_scale([r["probs"] for r in group], [r["gold_idx"] for r in group])
+  #     agent = router.load(model_name)                     # e.g. "english"
+  #     qt = {"choice": 0, "score": 1, "noul": 2}[qtype]
+  #     t_old = agent.temperature_by_options.get(bucket, agent.temperature[qt])
+  #     agent.temperature_by_options[bucket] = min(5.0, max(0.5, t_old / a))
+
+Caveats:
+  - Probabilities come rounded to 4 decimals, so the fit is approximate for very confident
+    answers. Good enough to see whether calibration improves; for production, refit from
+    logits or persist the values in the checkpoint's rl_agent_config.json
+    ("temperature_by_options") of a local copy.
+  - Laya clamps every temperature to 0.5..5.0; a fit outside that range is cut.
+  - Fit each bucket only with enough cases (at least 50 or so; the notebook uses at least
+    10 per type) (advice).
+  - Changing agent attributes affects only the running process.
+Then rerun eval_laya.py on the TEST split and compare ECE and the automation curve to A.
+
+
+8. Robustness checks (on the test split, Laya systems only)
+-----------------------------------------------------------
+  - Option order: shuffle choice criteria 3 times; report how often the answer changes.
+    (Repository reference: 0.15 to 0.23 at 20 options; Jev 0.13.)
+  - Label wording: replace choice keys with "A", "B", ... (mapping back for scoring).
+  - Language: accuracy per language; check each language's route.
+  - Length: accuracy for short, medium and long states; confirm long states keep the
+    deciding text (strings and dicts lose their end; conversation lists lose their start).
+  - Repeatability: run twice; Laya should give identical labels for identical input
+    (batch shape can cause tiny float differences near thresholds).
+
+
+9. Running Jev or an LLM (optional, system E)
+---------------------------------------------
+  - Jev takes the same request shape (POST /v1/systemone with state and questions), so the
+    same questions.json can be sent unchanged. The repository's
+    research/benchmarks/feishu_zh/run.py shows a careful runner (serial requests, warmup
+    excluded, raw responses saved, key read from TYPESAFE_API_KEY and never stored).
+  - Only send data that may leave our network. These calls cost money.
+  - For an LLM, ask for the label only, at temperature 0, with the same option texts; parse
+    strictly and count unparseable answers as errors.
+
+
+10. Decision rule (write it down before looking at the test results)
+--------------------------------------------------------------------
+Example (advice, adjust to our costs):
+  Adopt Laya (system B or C) for this workflow if, on the test split:
+    - its accuracy is within 2 points of the best alternative or better, AND
+    - at the chosen threshold it automates at least X% of cases at Y% accuracy, AND
+    - false actions cost no more than today, AND
+    - p95 latency and cost per 1,000 decisions meet our targets on our hardware.
+  Otherwise keep the current method, and note what would need to change (more labels,
+  better questions, a different workflow).
+
+
+11. Report template
+-------------------
+  Workflow, question set (attached), date, data period, number of cases per split.
+  Label agreement between annotators.
+  Table per system (A, B, C, D, E): accuracy, macro-F1, false actions, missed actions, ECE,
+    automation at threshold, p50/p95 latency, hardware, cost per 1,000.
+  Per-question and per-language tables.
+  Robustness results (order, labels, length, repeatability).
+  Decision against the rule in section 10, and next steps.
+  Attach records_*.json so every number can be recomputed without a model.
+
+
+12. Useful repository tools
+---------------------------
+  - laya.ece_score: the calibration metric used throughout the repository.
+  - research/eval/laya_eval.py: per-language accuracy and ECE with per-case JSON, but on
+    the MASSIVE intent dataset only (pip install laya datasets). Useful to check a
+    fine-tuned checkpoint has not lost general multilingual ability:
+      python research/eval/laya_eval.py --model ./our_model --langs en,de,es --out general.json
+  - research/eval/metamorphic.py: option-permutation and label-variant diagnostics (MASSIVE).
+  - research/benchmarks/feishu_zh/: a model-free audit design worth copying (hashes of the
+    data and prompts, every raw response archived, metrics recomputed offline).

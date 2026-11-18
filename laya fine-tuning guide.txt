@@ -1,0 +1,229 @@
+LAYA FINE-TUNING GUIDE
+======================
+From labelled decisions to a fine-tuned, calibrated Laya checkpoint we can serve. Facts come
+from the notebook notebooks/laya_finetune_typed_decisions_2xT4_kaggle.ipynb (read cell by
+cell on 2026-11-18), the README's Fine-Tuning section, docs/docker.md and docs/
+finetune_browser_agent.md. I have not run the notebook. Steps marked "(advice)" are my
+recommendations; steps marked "(untested)" are changes to the notebook nobody has verified.
+
+
+1. Why fine-tune
+----------------
+The base checkpoints are close to chance on structured business decisions: 0.362 (english)
+and 0.352 (multilingual) on the typed-decisions benchmark, below the 0.461 majority-class
+baseline. The checkpoint fine-tuned on that benchmark's training split scores 0.766, above
+TypeSafe Jev's published 0.727. The README's own summary: "Treat Laya as a fast base to
+specialise, not as a zero-shot decision engine."
+
+Other documented results:
+  - Browser agent (docs/finetune_browser_agent.md): element choice among ~45 candidates
+    from 0.10 zero-shot to 0.66, real-task success from 0% to 62%, on one 16 GB GPU.
+  - stuntd (community project): trains a small head per decision on the frozen encoder;
+    a 12-label intent task from 89.5% zero-shot to 100% trained.
+
+There is no official training command-line tool. docs/docker.md says training scripts are
+tracked in issues #4 and #26; the notebook is the reference implementation.
+
+
+2. What the notebook does, step by step
+---------------------------------------
+Environment: Kaggle, accelerator "GPU T4 x2", internet on. Uses both GPUs with
+DistributedDataParallel (torchrun --nproc_per_node=2).
+
+  Cell  What it does
+  ----  ---------------------------------------------------------------------------
+  2     Checks that 2 GPUs are visible (fails otherwise).
+  4     pip install laya, transformers, datasets and helpers.
+  6     Downloads convaiinnovations/laya (the English checkpoint, repo root) and the
+        dataset LocalLLaMA/typed-decisions ("all", split "train": 1,200 cases x 5
+        questions = 6,000 decisions). Turns each question into a training item with
+        laya.common.build_sequence (max_len and head_max_len from the config) and a
+        target probability vector. Saves /kaggle/working/train_items.pt.
+  8     Writes train_ddp.py (the training script, section 4).
+  10    Runs it with torchrun. Output: /kaggle/working/laya_finetuned_typed_decisions.
+  12    Loads the result with laya.Agent(OUTPUT_DIR, device="cuda") and predicts the
+        400-case test split, timing each call.
+  14    Computes accuracy, soft accuracy, Brier, KL, ECE (on max probability), score MAE,
+        and a comparison table against Jev's published numbers.
+  16    Optional: pushes the model to the Hugging Face Hub.
+  18    Saves a JSON report.
+
+Runtime: the notebook says the training cell takes "~4 to 6 minutes total"; the README says
+"roughly 4-5 hours for 4 epochs over ~30k questions". These cannot both describe the same
+run; plan for hours if our dataset is larger than 6,000 decisions, and check Kaggle's
+session time limit before starting.
+
+
+3. The data format the notebook expects
+---------------------------------------
+Each dataset row has string fields that hold JSON:
+
+  id         "case-0001"
+  workflow   "customer_service"                (used only for reporting)
+  state      '{"subject": "...", "body": "..."}'
+  questions  '{"category": {"type": "choice", "instructions": "...", "criteria": {...}},
+               "urgency":  {"type": "score",  "instructions": "...", "criteria": [...]},
+               "needs_human": {"type": "noul", "instructions": "..."}, ...}'
+  gold       '{"category":    {"label": "billing", "probabilities": {"billing": 0.9, "technical": 0.1, ...}},
+               "urgency":     {"label": 2, "score": 1.8, "probabilities": {"0": 0.0, "1": 0.2, "2": 0.8}},
+               "needs_human": {"label": "true", "noul": 0.85, "probabilities": {"false": 0.15, "true": 0.85}}}'
+
+Training uses gold[qid]["probabilities"] as a soft target (normalised to sum to 1; for
+noul the keys are "false" and "true"; for score the keys are "0", "1", ...). Evaluation
+uses "label" (and "score" / "noul" where present).
+
+If we only have hard labels (advice): write a one-hot distribution, e.g.
+  {"label": "billing", "probabilities": {"billing": 1.0}}
+Missing keys count as 0.0. Soft labels (for example from several annotators, or a teacher
+LLM's probabilities) carry more information and are what the benchmark used.
+
+Converting our data (advice, untested): produce a JSON Lines file with the same five
+fields (state, questions and gold as JSON strings), then in cell 6 replace
+  ds_train = load_dataset("LocalLLaMA/typed-decisions", "all", split="train")
+with
+  ds_train = load_dataset("json", data_files="our_train.jsonl", split="train")
+and do the same for the test split in cell 12. Cell 6's print message mentions "1,200
+cases"; it is only a message.
+
+Items whose options do not fit the token budget are silently dropped in cell 6
+(build_training_item returns None). Count the items it reports against what we expect.
+
+
+4. The training script (cell 8, train_ddp.py)
+---------------------------------------------
+Settings:
+  max_len 1024, head_max_len 256 (overriding the English checkpoint's 512 / 192)
+  epochs 4; micro-batch 8 per GPU; gradient accumulation 4 (effective 64 sequences)
+  AdamW, learning rate 2.5e-5 for the encoder and 1e-4 for the head, weight decay 0.01,
+  cosine schedule down to 1e-6, fp16 autocast with a gradient scaler, gradient clipping 1.0
+  gradient checkpointing on the encoder and the decision head (to fit T4 memory)
+
+Calibration hold-out: before training, min(400, 10% of items) are set aside with a fixed
+seed (20260922) and never trained on. (The README says the notebook calibrates on training
+items; the current code does not.)
+
+Loss, per batch:
+  1. RL part (GRPO-style): 4 noisy versions of the logits are sampled (Gaussian noise,
+     sigma falling from 0.4 to 0.1 over the epochs). Each is scored with
+     laya.common.proper_reward against the soft target (w_sph=0.75, w_rps=1.0). The
+     advantage is each sample's reward minus the group mean, normalised. The policy-
+     gradient loss pushes the logits toward higher-reward samples.
+  2. Soft cross-entropy against the target distribution, weight 1.0.
+  3. The act head is included only as 0.0 x act.sum(): it gets no gradient. This explains
+     why action.act_probability carries no signal in fine-tuned models.
+
+Saving:
+  - after each epoch, a rolling checkpoint in OUTPUT_DIR/checkpoint_latest (fp16 weights,
+    encoder config, tokenizer, checkpoint_meta.json), so a Kaggle timeout does not lose
+    everything
+  - at the end, OUTPUT_DIR with model.safetensors (fp16), encoder/, tokenizer/ and
+    rl_agent_config.json
+
+Temperature fitting (end of the script, on the held-out slice):
+  - one temperature per question type (choice, score, noul), fitted with LBFGS by
+    minimising cross-entropy against the soft targets
+  - a type with fewer than 10 held-out items gets 1.0; if fitting fails, 1.2 is used
+  - fitted values are limited to 0.1..10, but at load time Laya clamps to 0.5..5.0 and
+    warns, so a value outside 0.5..5.0 will not be used as fitted
+  - temperature_by_options is removed from the saved config, so old per-bucket values
+    from the base checkpoint cannot override the new per-type fit
+  - the config is marked "fine_tuned": true and "model_name": "laya-typed-decisions"
+    (change the name for our model, advice)
+
+
+5. Choosing the base checkpoint
+-------------------------------
+  - English traffic: the notebook's default, convaiinnovations/laya (repo root).
+  - Non-English or mixed traffic: start from the multilingual checkpoint (advice,
+    untested). Its files sit in the "multilingual" subfolder of the same repo, with the
+    same layout (rl_agent_config.json, model.safetensors, encoder/, tokenizer/). In cell 6:
+        root = snapshot_download(MODEL_ID, allow_patterns=["multilingual/*"])
+        model_dir = os.path.join(root, "multilingual")
+        _fix_tokenizer_config(model_dir)
+    The training script reads everything from model_dir, so it should then train the
+    multilingual model. mmBERT is smaller (322M), so it may train faster.
+  - Our own earlier fine-tune: point model_dir at its folder.
+After fine-tuning, the Router no longer chooses for us between english and multilingual
+for that workflow: we decide which fine-tuned model serves which traffic.
+
+
+6. Preparing good training data (advice)
+----------------------------------------
+  - Freeze the question wording first ("laya question design guide.txt"). The questions
+    and options are part of every training input; the model learns that exact text. Changing
+    the wording after training can lose part of the gain.
+  - Volume: the benchmark used 6,000 decisions (1,200 cases x 5 questions). Plan for a few
+    hundred cases per workflow as a minimum and more for rare classes.
+  - Balance: include enough examples of rare but important classes (urgent, fraud,
+    cancellation). Accuracy on them matters more than the average.
+  - Labels from an LLM: acceptable as a starting point (the benchmark's labels come from a
+    teacher model), but review a sample by hand and fix systematic errors.
+  - Hard cases: short messages, two topics in one message, sarcasm, other languages.
+  - Keep a test split that the notebook never sees (it evaluates on whatever test split
+    cell 12 loads).
+  - Remove personal data we may not upload to Kaggle; alternatively run the same code on
+    our own GPUs (it needs 2 GPUs as written; for one GPU, run train_ddp.py with
+    torchrun --nproc_per_node=1 and remove the 2-GPU check in cell 2, untested).
+
+
+7. Run it
+---------
+  1. Create a Kaggle notebook from the .ipynb; set accelerator GPU T4 x2 and internet on.
+  2. If using our data: upload our_train.jsonl / our_test.jsonl as a Kaggle dataset and
+     change cells 6 and 12 as in section 3.
+  3. Run cells 1 to 10. Watch the log: "Starting 2xT4 DDP training: N train items (M held
+     out for calibration)", then per-epoch loss and reward, then the fitted temperatures.
+  4. Run cells 12 and 14 for the evaluation on our test split.
+  5. Download OUTPUT_DIR (or push to a PRIVATE Hub repo, section 8).
+
+
+8. Push or keep the model
+-------------------------
+Cell 16 is hard-coded to NEW_REPO = "convaiinnovations/laya-typed-decisions". Change it to
+our own repository before running it, and make the repository private if the model was
+trained on internal data. The cell reads HF_TOKEN from Kaggle secrets (Add-ons -> Secrets).
+It is optional: we can download OUTPUT_DIR and keep it on our own storage instead.
+
+
+9. Use the fine-tuned model
+---------------------------
+  import laya
+  agent = laya.load("/models/our_triage_v1")            # a local folder
+  result = agent.predict(state, QUESTIONS)              # same frozen questions
+
+  from laya import Router
+  router = Router(models={"english": "/models/our_triage_v1"}, preload=True)
+  # English traffic now goes to our model; non-English still to multilingual
+
+Docker (one-shot quickstart): LAYA_MODEL_PATH=/models/custom with the folder mounted
+(docs/docker.md). laya-serve has no setting for a custom path; see
+"laya deployment guide.txt" for a small launcher.
+
+The folder must contain rl_agent_config.json, model.safetensors and the tokenizer (and
+encoder/ config). A LoRA adapter alone is not a complete checkpoint (docs/docker.md).
+Keep the folder writable: the loader may update the tokenizer configuration.
+
+
+10. Check the result
+--------------------
+  - Run "laya evaluation plan.txt" on our test split: accuracy, false and missed actions,
+    ECE on answer_confidence, the automation curve, latency.
+  - Compare with the base checkpoint and our current method on the same split.
+  - Look at the fitted temperatures printed at the end of training; if a value was outside
+    0.5..5.0, loading prints a warning and the clamped value is used, so refit or check
+    calibration on our test split.
+  - Check general ability did not collapse (optional): research/eval/laya_eval.py on a few
+    languages.
+  - Regression check for the config handling (CPU, no downloads):
+      python tests/test_calibration_persistence.py
+  - Version the model: folder name with date and data version, plus the notebook's JSON
+    report, so we can roll back.
+
+
+11. When to retrain
+-------------------
+  - The questions or options change.
+  - Accuracy or calibration on a fresh monthly sample drops (advice: keep labelling a small
+    sample of production traffic every month).
+  - New classes, products or languages appear.
+  - A new Laya base checkpoint is released (re-run the comparison first).
