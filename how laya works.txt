@@ -1,0 +1,324 @@
+HOW LAYA WORKS
+==============
+
+This file explains the mechanics: what goes in, what happens inside, and what comes out.
+Everything here was checked against the code in laya/ (common.py, agent.py, router.py,
+lang.py, structured.py, hooks.py) on 2026-11-18. Numbers are the repository's own; I did
+not run a model.
+
+
+1. The one-sentence model
+-------------------------
+Laya is a transformer encoder with a small decision head on top. You pass it a state (the
+text, JSON or conversation to decide about) and a set of typed questions. For each question
+it reads the question, the options and the state together, and in ONE forward pass gives a
+probability for every option. There is no text generation and nothing to parse.
+
+
+2. The inputs
+-------------
+State
+  A plain string, a dict, or a list (a list is treated as a conversation, oldest first).
+  Dicts and lists are serialised to JSON with non-ASCII kept as is (serialize_state in
+  common.py), so Hindi or Chinese text reaches the tokenizer unchanged.
+
+Questions
+  A dict keyed by question id. Each question has:
+    type          "choice" | "score" | "noul"
+    instructions  the question text (required; a dict or list is turned into JSON)
+    criteria      the options (see section 4)
+    labels        noul only, optional: how the two answers are worded to the model
+
+  Validation happens before any model work (Agent._check_question). A malformed question
+  raises a ValueError that names the question and the fix, for example a choice with no
+  options, a score whose criteria is not a list, or a noul whose criteria uses keys other
+  than "true" and "false".
+
+
+3. Step 1 - Choosing the checkpoint (Router only)
+-------------------------------------------------
+If you call the Router, it first decides which checkpoint to run (router.py, _route). It
+uses this precedence, highest first:
+
+  1. explicit model=...        ("english", "multilingual", "typed-decisions", or an alias
+                                such as "en", "ml", "multi", "typed")
+  2. explicit task=...          task="typed_decisions" selects the typed-decisions model
+  3. detected workflow          only with Router(auto_task_detection=True): the question IDs
+                                must exactly match one of four workflows, e.g. customer
+                                service = {action, category, churn_risk, needs_human, urgency}
+  4. explicit lang=...          "en" goes to english, any other real language code to
+                                multilingual; a blank value is ignored
+  5. lang_guess                 your own language detector (a code or a function of the
+                                state); if it returns nothing, detection continues
+  6. built-in detection         lang.py, see below
+  7. default                    "english" unless you set Router(default="multilingual")
+
+Built-in detection (lang.py, dependency-free, pure Python):
+  a. Script. Every letter is assigned a Unicode script (Latin, Cyrillic, Arabic,
+     Devanagari, Thai, Khmer, CJK and many more). Non-Latin text goes to multilingual.
+     Mixed text that is mostly Latin is still treated as non-Latin if at least 20% of its
+     letters are non-Latin (or at least 10% and at least 10 letters).
+  b. Latin language guess. Word lists of common function words exist for 10 languages:
+     en, fr, de, es, pt, it, nl, ro, bn, az. Text with fewer than 4 words is "undecided".
+     A non-English language must beat English by a clear margin and match at least one
+     word no other list shares. A rate of accented non-English letters of 2% or more marks
+     text as "looks non-English".
+  c. The outcome:
+       no letters at all                         -> default
+       non-Latin script                          -> multilingual
+       Latin, guessed non-English                -> multilingual
+       Latin, undecided, has non-English letters -> multilingual
+       Latin, undecided, no such letters         -> default (e.g. "Quero cancelar")
+       Latin, English                            -> english
+
+The decision and the reason come back with every result, for example:
+  {'model': 'multilingual', 'repo': 'convaiinnovations/laya/multilingual',
+   'reason': 'non-Latin script (devanagari, 100% of letters); the English checkpoint cannot read it'}
+
+Why it matters: the English checkpoint does not degrade gently outside English, it collapses
+and stays confident (Khmer 0.000 accuracy at 0.952 confidence, Hindi 0.100 on a 20-option
+task where random is 0.050). Confidence gating cannot catch that, so routing must.
+
+Memory: the Router keeps up to max_loaded=2 checkpoints (least recently used evicted).
+Rebuilding an evicted checkpoint costs seconds (README: about 7.4 s median on CPU), so a
+server should use Router(preload=True). Inference itself is not locked, so concurrent calls
+share a loaded checkpoint.
+
+
+4. Step 2 - Turning each question into a token sequence (common.py, build_sequence)
+-----------------------------------------------------------------------------------
+Layout:
+
+  [CLS] <type> question: <instructions> [SEP]
+        [MASK] <option0 text> [MASK] <option1 text> ... [SEP]
+        <state tokens> [SEP]
+
+How options are written:
+  - choice: "label: description", or just "label" when there is no description. A list of
+    labels is accepted and treated as labels without descriptions.
+  - score:  "level 0: text", "level 1: text", ...
+  - noul:   the two options "false" and "true" (or your labels), with any descriptions.
+  - Structured descriptions (dicts, numbers) are written as compact JSON.
+
+Why [MASK]: each option starts with a [MASK] token, and the model's output at that position
+is the score for that option. That is how one pass scores every option at once.
+
+Token budgets:
+  - max_len is the whole sequence; head_max_len is the part for question plus options.
+      english:               max_len 512,  head_max_len 192  (about 320 tokens of state)
+      multilingual, typed:   max_len 1024, head_max_len 256  (about 768 tokens of state)
+    Both can be changed per call (predict(..., max_len=8192)) or in agent.cfg.
+  - Each option is cut to 48 tokens. If all options together still do not fit, each is cut
+    further, to a minimum of 4 tokens. If even that does not fit inside max_len, Laya raises
+    "options exceed head_max_len" instead of answering silently with missing options.
+  - The question text gets whatever room is left (at least 8 tokens).
+
+Truncation of the state (agent.py, _encode_state):
+  - Strings and dicts: the start is kept and the end is cut.
+  - Lists (conversations): the end is kept and the start is cut, so the newest turn
+    survives.
+  - The state is tokenised once and shared by every question in the call.
+
+
+5. Step 3 - The forward pass (common.py, DecisionModel; agent.py)
+-----------------------------------------------------------------
+  a. Encoder. A bidirectional transformer reads the whole sequence at once:
+       english:          ModernBERT-large (421M parameters in total)
+       multilingual:     mmBERT-base (322M)
+       typed-decisions:  ModernBERT-large, fine-tuned
+     "Bidirectional" means every token sees every other token. Nothing is generated token
+     by token, which is what "non-autoregressive" means here.
+
+  b. Question-type embedding. A learned vector for choice, score or noul is added to every
+     position.
+
+  c. Decision head. A small transformer (head_layers from the config, 2 by default) over the
+     encoder output, so the option positions can look at the question and state again.
+
+  d. Scorer. A small network gives one logit per [MASK] position (per option).
+
+  e. Act head. A separate small network reads the [CLS] vector plus four summary features
+     (top probability, gap between the top two, normalised entropy, option count / 255) and
+     outputs a probability reported as action.act_probability. The README says it carries no
+     usable signal yet (it reads about 1.0 for almost every input), so do not use it.
+
+  Precision and devices: CUDA uses fp16 or bf16 autocast; Apple MPS uses fp16 only when a
+  batch has at least 5 rows; CPU runs fp32 unless LAYA_CPU_AMP=bf16 is set. If the GPU runs
+  out of memory, the agent moves to CPU and retries the request (it prints a warning).
+
+  Batching: predict_batch packs many states into shared forward passes. It helps most on a
+  GPU (README: about 10 ms per decision one at a time against about 1 ms batched on an RTX
+  5060 Ti). Optional fast path: laya[fast] uses fused TileLang kernels and CUDA graphs.
+
+
+6. Step 4 - Turning logits into answers (agent.py, _decode_answers)
+-------------------------------------------------------------------
+Temperature first:
+  Each option's logit is divided by a temperature before the softmax. The temperature is
+  chosen in this order:
+    1. a per-language override (Agent(lang_temperatures=...), used when lang is given)
+    2. a per-bucket value, keyed by question type and option-count bucket:
+         "choice:2", "choice:3-5", "choice:6-10", "choice:11+", and the same for score and noul
+    3. a per-type value (one for choice, one for score, one for noul)
+  Every value is clamped to 0.5..5.0; a missing or invalid value becomes 1.0, and a warning
+  lists what was changed. The reason: one shipped bucket (choice:11+) was 0.1006, which would
+  turn a 0.24 probability into 0.99.
+
+Then each type gives a different answer:
+
+  choice
+    {"type": "choice",
+     "choice": "billing",                         # the most likely option
+     "probabilities": {"billing": 0.94, ...},     # sums to 1
+     "confidence": ...,                           # 1 - normalised entropy (NOT calibrated)
+     "answer_confidence": 0.94,                   # top probability (the calibrated number)
+     "action": {"act_probability": ...}}
+
+  score
+    {"type": "score",
+     "score": 1.84,                               # expected level: sum of level x probability
+     "legend": {"0": "not urgent", ...},
+     "probabilities": {"0": ..., "1": ..., "2": ...},
+     "confidence": ..., "answer_confidence": ..., "action": {...}}
+    A score of 1.84 on a 0..2 scale means the probability mass sits mostly near level 2.
+
+  noul
+    {"type": "noul",
+     "noul": 0.892,                               # P(true)
+     "confidence": 0.892,                         # max(P(true), P(false))
+     "answer_confidence": 0.892,                  # same value for noul
+     "action": {...}}
+
+The two confidence fields, and which to use:
+  - answer_confidence is max(probabilities). It is the value temperature scaling fits and the
+    value every ECE figure in the repository is computed on. Use it for gating.
+  - confidence for choice and score is 1 minus the normalised entropy of the whole
+    distribution. It measures how spread out the probabilities are and is not calibrated.
+    The code says these two must not be compared against the same threshold.
+  - Watch out: the README's gating example and the LangChain LayaRouter's
+    confidence_threshold both read `confidence`, not `answer_confidence`.
+
+Calibration in practice: the shipped checkpoints are over-confident. Mean ECE is 0.466 for the
+English checkpoint as shipped, and 0.081 after refitting one temperature per (question type,
+option count) on held-out data. The multilingual checkpoint ships with no fitted
+temperatures (0.314, falling to 0.106 after a fit). So fit temperatures on your own data
+before you trust any confidence number.
+
+
+7. How the model was trained
+----------------------------
+The README calls it RLCD: reinforcement learning with a GRPO-style policy gradient, where the
+reward is a strictly proper scoring rule. proper_reward in common.py is:
+
+  reward = log score (floored at -9.21)
+         + 0.5 x spherical score
+         - 1.0 x ranked probability score   (score questions only, so near misses on an
+                                             ordered scale cost less than far misses)
+
+A strictly proper scoring rule is maximised only when the reported probabilities match what
+the model actually believes, so the model is pushed towards honest probabilities rather than
+confident guesses. td_lambda_targets in common.py builds TD(lambda) targets for multi-turn
+conversation trajectories, so earlier turns get credit from the final outcome.
+
+Fine-tuning is the main way to get accuracy. On the typed-decisions benchmark (2,000
+decisions) the base English checkpoint scores 0.362, below the 0.461 majority-class
+baseline, and the fine-tuned checkpoint scores 0.766. The Kaggle notebook (2x T4, about 4 to
+5 hours for 4 epochs over ~30k questions) trains, fits one temperature per question type,
+and removes old per-bucket temperatures so they do not override the new fit. Its calibration
+samples come from the training items, so evaluate on separate held-out data.
+
+
+8. What comes back
+------------------
+predict() (the same method as system_one()) returns:
+
+  {
+    "answers": {
+      "department": {"type": "choice", "choice": "billing", "probabilities": {...},
+                     "confidence": ..., "answer_confidence": ..., "action": {...}},
+      "urgency":    {"type": "score", "score": 1.84, "legend": {...}, ...},
+      "churn_risk": {"type": "noul", "noul": 0.892, ...}
+    },
+    "usage": {"input_tokens": <tokens processed>, "output_tokens": 0},
+    "routing": {"model": "english", "repo": "...", "reason": "...", ...}   # Router only
+  }
+
+output_tokens is always 0 because nothing is generated. An empty question set returns empty
+answers and zero usage without tokenising anything.
+
+decide() with a schema returns plain values instead:
+  - enum or const field  -> the chosen value
+  - boolean field        -> True when P(true) >= 0.5
+  - bounded integer      -> the most likely level (argmax) plus the schema minimum
+                            (not the rounded expected score)
+With return_details=True it returns the values plus the raw answers.
+
+
+9. Known limits (from the README and benchmarks)
+-----------------------------------------------
+  - Not a zero-shot engine for new business workflows. Base checkpoints are near chance on
+    typed-decisions, and on a 64-case Chinese workplace test the untuned multilingual
+    checkpoint got 20/64 where Jev got 64/64 (see "laya vs typesafe jev.txt").
+  - Many options. All options share head_max_len, so 77 options get about 3 to 4 tokens
+    each (Banking77: 0.425 against Jev's 0.870). Fixes: a larger budget, predict_shortlist,
+    or a coarse question followed by a fine question.
+  - Option order. At 20 options the answer changes when options are reordered 15% of the
+    time (english) or 23% (multilingual) on MASSIVE intent; Jev was measured at 13%.
+  - Boolean-looking labels in choice questions ("true", "false", "yes", "no") can override
+    the descriptions. Use meaningful or neutral keys such as "A", "B".
+  - noul on the English checkpoint can follow its "false:"/"true:" labels instead of the
+    text (issue #156). Use the labels mapping, or a two-option choice with neutral keys.
+  - Score questions are the weakest type (SST-5: 0.372), and the multilingual checkpoint
+    rarely picks the first level (issue #131).
+  - Moderation is weak on held-out data (0.530). Jailbreak guardrails score 0.708 to 0.762.
+  - act_probability carries no usable signal.
+
+
+10. Where the code lives, step by step
+-------------------------------------
+  Checkpoint choice              laya/router.py (_route), laya/lang.py (analyse)
+  Question validation            laya/agent.py (_check_question, _to_internal)
+  State tokenising, truncation   laya/agent.py (_encode_state)
+  Question rendering             laya/common.py (render_options, build_sequence)
+  Forward pass, OOM fallback     laya/common.py (DecisionModel), laya/agent.py (_infer, _forward)
+  Temperatures and answers       laya/agent.py (_decode_answers), laya/common.py (temp_bucket,
+                                 clamp_temperature, answer_confidence, confidence_from_probs)
+  Training reward                laya/common.py (proper_reward, td_lambda_targets)
+  Calibration metric             laya/common.py (ece_score, 15 bins)
+  Schema layer                   laya/structured.py
+  Hooks around each call         laya/hooks.py
+  Long-label shortlist           laya/shortlist.py
+  Email cleaning                 laya/email.py
+  GPU fast path                  laya/fast.py, laya/tl_kernels.py
+  ONNX backend                   laya/onnx_agent.py
+  TypeScript port                laya-ts/src/ (same pipeline on ONNX Runtime)
+
+
+11. A worked example, end to end
+--------------------------------
+State:     {"subject": "Duplicate charge", "body": "We were billed twice for March."}
+Question:  department (choice: billing / technical / other)
+
+  1. Router: script Latin; English function words found ("were", "for"); route to english.
+  2. Render: [CLS] choice question: Which department should handle this? [SEP]
+             [MASK] billing: invoices, payments, refunds [MASK] technical: bugs, outages
+             [MASK] other: everything else [SEP] {"subject": "Duplicate charge", ...} [SEP]
+  3. Forward: one pass through ModernBERT-large and the decision head.
+  4. Read the three logits at the [MASK] positions, divide by the "choice:3-5" temperature
+     (or the choice default), softmax.
+  5. Return choice "billing" with its probabilities. The answer_confidence is the billing
+     probability; the confidence field is the entropy-based value. Exact numbers depend on
+     the model; none were measured here.
+
+
+Corrections from the first version of this file
+-----------------------------------------------
+  - Section 6 used to say `confidence` is the calibrated top probability. For choice and
+    score it is entropy-based; `answer_confidence` is the calibrated one.
+  - Temperatures are per option-count bucket (2, 3-5, 6-10, 11+), not per exact count, and
+    per-language overrides exist.
+  - Truncation is automatic: conversation lists keep their newest turns. There is no user
+    "truncate_left" switch on predict.
+  - The act head has a defined input (CLS plus four features); it is not "two outputs".
+  - Training is GRPO-style policy gradient; the reward weights are now stated exactly.
+  - Routing precedence, the 10 word-list languages and the decide() score rule are added.

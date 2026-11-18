@@ -1,0 +1,185 @@
+LAYA VS TYPESAFE JEV
+====================
+(Re-checked on 2026-11-18 against README.md, BENCHMARKS.md, laya/serve.py and the archived
+results in research/benchmarks/feishu_zh/. Corrections are listed at the end.)
+
+
+What each one is
+----------------
+Laya
+  An open-source package (Python, plus a TypeScript port), Apache 2.0, by Convai
+  Innovations. You run it yourself on CPU or GPU, in your own process or server. No account
+  or API key; your data stays on your machine. The weights come from Hugging Face
+  (convaiinnovations/laya) on first use.
+
+TypeSafe Jev
+  A hosted, closed decision API from TypeSafe. You call it over the network and pay per
+  token. The Laya README gives its price as $0.042 per 1M tokens (I did not check this with
+  TypeSafe). The version cited in the benchmarks is jev-1.13.0. Its endpoint is
+  POST /v1/systemone.
+
+Both do the same job: typed decisions over text (choice, score, yes/no "noul") that return
+probabilities. Laya's server copies Jev's wire format on purpose, so the two can be swapped.
+
+
+Where the numbers come from (read this first)
+---------------------------------------------
+There are two kinds of evidence in the repository, and they point in different directions.
+
+  A. Published-figure comparisons (README and BENCHMARKS.md). Laya was measured by its
+     team. Jev's figures are third-party published numbers, "never measured here (no
+     TypeSafe API access), so sample sizes and prompts differ". Treat as indicative.
+
+  B. One paired test with real recorded Jev responses: the Chinese workplace benchmark in
+     research/benchmarks/feishu_zh/ (64 synthetic cases, the same frozen prompts sent to
+     both, all 768 raw responses archived and auditable offline). Small, but it is the only
+     like-for-like run in the repository.
+
+
+A. The published-figure comparison
+----------------------------------
+Metric                          Jev 1.13.0 (published)  Laya (routed, measured)  Leader
+------------------------------  ----------------------  -----------------------  ------
+typed-decisions, 2,000 items    0.727                   0.766 *                  Laya
+AG News (4 labels)              0.910                   0.950                    Laya
+DAIR Emotion (6 labels)         0.480                   0.595                    Laya
+Banking77 (77 labels)           0.870 (on 72 labels)    0.425                    Jev
+ECE, lower is better            0.246                   0.081 **                 Laya
+p50 latency, 1 question         236-276 ms              32.8 ms (T4 GPU)         Laya
+Languages with numbers          none published          45 of 51 usable          -
+Weights                         closed API              Apache 2.0               -
+Cost                            $0.042 / 1M tokens      $0 self-hosted           -
+
+ *  0.766 is the typed-decisions checkpoint, fine-tuned on that benchmark's own training
+    split. The base checkpoints score 0.362 (english) and 0.352 (multilingual) on it.
+ ** 0.081 is after refitting temperatures on held-out data. As shipped, the English
+    checkpoint's mean ECE is 0.466. The repository does not say whether Jev's 0.246 came
+    from a fitted model, so this row compares a tuned Laya with an unknown Jev setting.
+
+Other published points:
+  - On DAIR Emotion, Jev gave zero probability to the true label on 16% of examples.
+  - Option-order stability (how often the answer changes when the options are shuffled):
+    Jev 0.13. Laya at 20 options (MASSIVE intent, English): 0.150 (english checkpoint),
+    0.230 (multilingual). Laya is more stable on fewer options (emotion 0.040, XNLI 0.000).
+  - Batched throughput for Laya: 103 to 332 questions per second on one T4.
+
+
+B. The paired Chinese workplace test (feishu_zh)
+-----------------------------------------------
+64 synthetic Chinese work-chat scenarios, 8 families (ownership, cancellation, urgency,
+knowledge sharing, conditions, thread context, cross-chat interference and more), 4
+balanced labels: urgent / todo / valuable / noise. Two modes: one choice question, and four
+separate yes/no questions combined with fixed thresholds. Three repeats per backend.
+Archived on 2026-09-21.
+
+                                     Jev 1.13.0      Laya multilingual (base, untuned)
+  ---------------------------------  --------------  ---------------------------------
+  choice, correct (first repeat)     64 / 64         20 / 64
+  four yes/no, correct               63 / 64         18 / 64
+  false task assignments, choice     0               22
+  false task assignments, yes/no     0               30
+  missed tasks, choice               0               6
+  same label on all three repeats    63/64, 64/64    64/64, 64/64
+  p50 time, choice                   253 ms          150 ms
+  p50 time, four yes/no              250 ms          415 ms
+
+How to read it:
+  - Jev is far more accurate here. Laya also wrongly turned many non-actions into tasks,
+    which the benchmark treats as the most important failure.
+  - Laya was the base multilingual checkpoint with no fine-tuning and no temperature
+    fitting. The English and typed-decisions checkpoints were not tested.
+  - Laya ran locally on an Apple M4 (MPS, float32). Jev's time includes the network. They
+    were not run at the same time or on the same hardware, so the timings are not a fair
+    speed comparison in either direction.
+  - 64 related synthetic cases with AI-assisted labels: a diagnostic, not a ranking.
+  - Laya gave exactly the same label on every repeat (it is deterministic for a fixed
+    input).
+
+This result agrees with Laya's own "honest limits": untuned base checkpoints are weak on new
+business workflows. The published-figure wins in part A come mostly from a fine-tuned
+checkpoint or from simple public datasets.
+
+
+Where Jev leads
+---------------
+1. Zero-shot accuracy on a new workflow. The paired test (64/64 vs 20/64) and Laya's own
+   base-checkpoint numbers (near chance on typed-decisions) both say so.
+2. Many options per question (over about 20). Banking77: 0.870 against 0.425. In Laya all
+   options share one token budget (head_max_len 192 on English, 256 on multilingual), so
+   77 options get about 3 to 4 tokens each.
+3. Soft distribution matching. Against the teacher model's full probability distribution
+   on typed-decisions, Jev's soft accuracy is 0.580 against 0.471 for fine-tuned Laya.
+4. Raw calibration before any fitting. On typed-decisions Jev's ECE is 0.144; the fine-tuned
+   Laya checkpoint's is 0.213 and the base English checkpoint's is 0.175.
+5. Option-order stability at 20 options (0.13 against 0.150 and 0.230).
+6. No operations work: no model hosting, GPUs, updates or temperature fitting on your side.
+
+
+Where Laya leads
+----------------
+1. Accuracy after fine-tuning on your own labels (typed-decisions 0.766 vs 0.727, above the
+   0.735 teacher ceiling), and the freedom to fine-tune at all. Jev is closed.
+2. Speed on a GPU: 32.8 ms per question on a T4 against Jev's 236 to 276 ms published p50.
+   On CPU or Apple silicon Laya is slower (the paired test measured 150 to 415 ms).
+3. Cost at volume: no per-token fee; you pay for your own hardware.
+4. Privacy and data control: text never leaves your network.
+5. Calibrated confidence after a temperature fit (ECE 0.081), which makes "automate above X,
+   escalate below X" workable. Use the answer_confidence field for this.
+6. Multilingual evidence: per-language numbers for 51 languages (45 usable). The repo has no
+   per-language Jev numbers, though Jev won the one Chinese test.
+7. Runs offline, at the edge, in a browser (laya-ts), and on CUDA, MPS, XPU or CPU.
+8. Integrations: Python API, CLI, Jev-compatible HTTP server, MCP server, LangChain and
+   LangGraph components, prediction hooks, Docker, Nix.
+
+
+Compatibility in practice
+-------------------------
+  - Same wire format. laya-serve accepts POST /v1/systemone with {"state", "questions",
+    "model"}. A Jev client (the README names the hs-jev Haskell client) only changes its
+    base URL.
+  - The response carries the same answers and usage block, plus a routing block that Jev
+    clients ignore.
+  - The "model" field is honoured only when it names a Laya checkpoint (english,
+    multilingual, typed-decisions); a Jev model ID is ignored and the router chooses.
+  - Authentication: optional bearer key (LAYA_API_KEY). A malformed or wrong key returns
+    401.
+  - Limits that differ from a hosted API: at most 64 questions, 50,000 state characters
+    and a 2 MB body per request. laya-serve runs one prediction at a time (one worker
+    thread behind a lock), so plan throughput with batching or several instances.
+  - A community project, stuntd, also runs Laya behind the Jev API and trains a small head
+    per decision on your own labelled rows.
+
+
+Which one for which situation
+-----------------------------
+Situation                                              Better fit
+-----------------------------------------------------  ---------------------------------
+New workflow, no labelled data yet                     Jev
+Many labels (over about 20), no time to tune           Jev (or Laya with a shortlist, tested)
+Data must not leave our network, or regulated data     Laya
+High volume, cost matters                              Laya
+Lowest latency per decision, with a GPU                Laya
+We can label a few hundred examples and fine-tune      Laya (measure against Jev first)
+No one to run models or GPUs                           Jev
+Need a vendor SLA and support                          Jev (check its terms)
+Offline, edge or in-browser                            Laya
+
+
+Caveats
+-------
+  - Part A uses third-party Jev figures; part B is small and synthetic. Neither was run by
+    us. Measure both on our own labelled sample before choosing.
+  - I have not checked Jev's current price, terms, SLA or data policy.
+  - The archived paired test is from 2026-09-21 and does not score the current Laya code.
+
+
+Corrections from the first version of this file
+-----------------------------------------------
+  - Added the paired Feishu test, which I had missed. It is the only like-for-like
+    comparison and Jev wins it clearly; this changes the overall picture.
+  - The raw-ECE comparison now names the right checkpoints (fine-tuned 0.213, base 0.175,
+    Jev 0.144).
+  - Removed my claim that Jev's 0.246 ECE was "not described as temperature-fitted"; the
+    repository does not say either way.
+  - Added option-order stability, the DAIR zero-probability result, the server's one-at-a-
+    time execution and its request limits.
