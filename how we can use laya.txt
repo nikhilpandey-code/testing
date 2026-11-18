@@ -1,0 +1,407 @@
+HOW WE CAN USE LAYA
+===================
+(Re-checked on 2026-11-18 against the code and docs. Corrections are listed at the end.)
+
+Every practical way to use Laya, with setup, commands and code. Pick the route that matches
+what we are building. I have not run any of these commands myself.
+
+
+0. Install and check
+--------------------
+Requirements: Python 3.10 to 3.13. A GPU is optional; CPU works but is slower.
+
+  python3 -m venv .venv
+  .venv/bin/python -m pip install laya
+  .venv/bin/python -I -c "import laya; print(laya.__version__)"     # no model is loaded
+
+Optional extras (install only what we need):
+  laya[serve]       HTTP server (fastapi, uvicorn, python-multipart)
+  laya[mcp]         MCP server for MCP clients (Claude Desktop, Cursor, ...)
+  laya[langchain]   LangChain and LangGraph components (laya[langgraph] is the same)
+  laya[onnx]        ONNX Runtime backend
+  laya[fast]        TileLang GPU fast path (CUDA only)
+  Pydantic for decide(): the README mentions laya[structured], but pyproject.toml does not
+  define that extra. Install pydantic directly.
+
+From source:
+  .venv/bin/python -m pip install "git+https://github.com/NandhaKishorM/laya.git"
+
+The first prediction downloads a checkpoint from Hugging Face (the multilingual one is about
+678 MB). Routing alone downloads nothing. For a private or gated repo set HF_TOKEN.
+
+Devices: picked automatically in the order CUDA, Apple MPS, Intel XPU, CPU, or set with
+device="cuda" / "mps" / "cpu". If the GPU runs out of memory, Laya prints a warning and
+continues on CPU, which is roughly 10 to 15 times slower. Watch the logs for that warning.
+
+
+1. Quick test from the command line
+-----------------------------------
+  laya "I was charged twice, please refund"
+      Routing decision only. Offline, milliseconds, no download.
+
+  laya "Refactor this service" --predict
+      Full answers to the built-in router questions. Downloads the checkpoint on first use.
+
+  laya "My payment failed twice" --preset triage
+      Answers a preset (email, guard, moderation, router, triage). Implies --predict.
+
+  laya "Mein Konto wurde zweimal belastet" --lang de      force a language
+  laya "..." --predict --model english                    force a checkpoint
+  laya "..." --predict --device cpu --json                 device, raw JSON output
+  laya                                                     interactive mode
+
+If a checkpoint cannot be downloaded, the CLI prints why and exits with code 2 instead of
+crashing. Use the CLI to check routing and answers on a few real examples before writing code.
+
+
+2. Python: the Router (recommended default)
+-------------------------------------------
+  from laya import Router
+
+  router = Router()                      # lazy loading, keeps up to 2 checkpoints
+  # router = Router(preload=True)        # load all three now, for a server
+
+  state = {
+      "from": "user@acme.com",
+      "subject": "Duplicate charge on invoice #4411",
+      "body": "Hi, we were billed twice for March. Please refund the duplicate today."
+  }
+
+  questions = {
+      "department": {
+          "type": "choice",
+          "instructions": "Which department should handle this request?",
+          "criteria": {"billing": "invoices, payments, refunds",
+                       "technical": "bugs, outages, system errors",
+                       "other": "everything else"},
+      },
+      "urgency": {
+          "type": "score",
+          "instructions": "How urgent is this request?",
+          "criteria": ["not urgent", "soon", "critical deadline or blocking issue"],
+      },
+      "churn_risk": {
+          "type": "noul",
+          "instructions": "Does the user threaten to cancel or leave?",
+      },
+  }
+
+  result = router.predict(state, questions)
+  dept = result["answers"]["department"]
+  print(dept["choice"], dept["answer_confidence"])        # label and its probability
+  print(result["answers"]["urgency"]["score"])             # expected level, 0..2
+  print(result["answers"]["churn_risk"]["noul"])           # P(yes)
+  print(result["routing"]["model"], result["routing"]["reason"])
+
+Useful options:
+  router.route(state, questions).reason          # routing only, no model loaded
+  router.predict(state, questions, model="multilingual")    # force a checkpoint ("en", "ml" also work)
+  router.predict(state, questions, lang="de")     # we already know the language
+  router.predict(long_doc, questions, model="multilingual", max_len=8192)   # long documents
+  Router(default="multilingual")                  # if most of our traffic is not English
+  Router(lang_guess=my_detector)                  # plug in our own language detector
+  Router(auto_task_detection=True)                # auto-pick typed-decisions for its 4 workflows
+  router.preload(["english", "multilingual"]); router.unload()
+  router.decide(state, schema=...)                # schema mode, see section 5
+
+Question writing tips (from the README's known limits):
+  - choice criteria can be a dict (label -> description) or a list of labels.
+  - Do not use "true", "false", "yes", "no" as choice labels; use real names or "A", "B".
+  - noul criteria may only have the keys "true" and "false". To change the wording, use
+    "labels": {"true": "A", "false": "B"}.
+  - For English score questions, route to the English checkpoint; the multilingual one
+    rarely picks the first level.
+
+
+3. Batches
+----------
+For a backlog of tickets, rows of a CSV, or a log slice:
+
+  requests = [{"state": text, "questions": questions} for text in tickets]
+  results = router.predict_batch(requests, batch_size=8)   # same order as the input
+  routes  = router.route_batch(requests)                   # decisions only, nothing loaded
+
+Requests are grouped by checkpoint and question set and sent through shared forward passes.
+Each request may set its own model, task, lang or lang_guess. predict_many is an alias.
+
+One checkpoint, same questions, many states:
+  agent = laya.load("convaiinnovations/laya")
+  results = agent.predict_batch(states, questions, batch_size=64, sort_by_length=True)
+
+On a GPU batching is a large win (README: about 10 ms per decision alone, about 1 ms batched).
+On CPU the gain is small; sort_by_length can help with mixed lengths.
+
+
+4. One checkpoint directly (no routing)
+---------------------------------------
+  import laya
+  agent    = laya.load("convaiinnovations/laya")                              # English
+  agent_ml = laya.load("convaiinnovations/laya", subfolder="multilingual")
+  agent_td = laya.load("convaiinnovations/laya", subfolder="typed-decisions")
+  agent_lc = laya.load("./my_finetuned_model")                                # local folder
+
+  result = agent.predict(state, questions)      # predict and system_one are the same method
+
+  with laya.load("convaiinnovations/laya") as agent:     # frees the model when done
+      ...
+
+Token budget per agent: agent.cfg["max_len"], agent.cfg["head_max_len"], or pass
+max_len= / head_max_len= to predict for one call. Per-language temperatures can be passed
+with laya.load(..., lang_temperatures={...}).
+
+
+5. Schema mode: typed values without writing questions
+------------------------------------------------------
+  schema = {
+      "type": "object",
+      "properties": {
+          "department":  {"type": "string", "enum": ["billing", "support", "sales"],
+                          "description": "Which team should handle this?"},
+          "urgency":     {"type": "integer", "minimum": 0, "maximum": 2},
+          "needs_human": {"type": "boolean"},
+      },
+  }
+  values  = agent.decide("I was charged twice, refund me.", schema=schema)
+  # {"department": "billing", "urgency": 2, "needs_human": True}
+  details = agent.decide(text, schema=schema, return_details=True)   # values plus raw answers
+  laya.decide(router, text, schema=MyPydanticModel)                   # pydantic works too
+
+Rules (structured.py):
+  - enum or const -> choice; boolean -> yes/no; integer with minimum and maximum -> score.
+  - Free strings, arrays and nested objects are rejected with an error naming the field.
+  - Limits: 32 properties, 32 options per enum, 10 levels per integer range.
+  - Booleans are True when P(true) >= 0.5. Integers are the most likely level, not the
+    rounded average. If we need a different threshold, use the raw answers instead.
+
+
+6. Presets
+----------
+  router.predict({"message": text}, laya.triage_questions())
+      intent, is_urgent, frustration, refund_requested, churn_risk
+  router.predict(laya.email_state(subject, body, sender), laya.email_questions())
+      category, is_spam, is_phishing, urgency, needs_reply
+      (email_questions(categories={...}) replaces the default categories)
+  router.predict({"prompt": text}, laya.guard_questions())
+      jailbreak, prompt_injection, sensitive_data, harm_severity, topic
+  router.predict({"post": text}, laya.moderation_questions())
+      toxic, harassment, threat, spam, severity
+  router.predict({"request": text}, laya.router_questions())
+      difficulty, domain, needs_tools, is_sensitive (for picking a small vs large LLM)
+
+Measured quality: spam and phishing are very strong (0.98 to 0.99, but those datasets were
+in training); jailbreak guardrails 0.708 to 0.762; moderation weak at 0.530 on held-out data.
+Test on our own traffic.
+
+
+7. Email input
+--------------
+  from laya import email_state, clean_email_body
+  state = email_state(subject, raw_body, sender="a@b.com")     # signature:
+  # email_state(subject, body, sender=None, clean=True, **extra) -> {"subject", "body", "from", ...}
+  text  = clean_email_body(raw_body)                            # max_chars=3000 by default
+
+Cleaning removes quoted history, Gmail and Outlook reply markers, sign-offs and
+confidentiality footers in English, Portuguese and Spanish, then caps the body at 3,000
+characters. Other languages are only partly cleaned.
+
+
+8. Choice questions with many options (over about 20)
+-----------------------------------------------------
+  a. Bigger budget:   agent.cfg["head_max_len"] = 512; agent.cfg["max_len"] = 1024
+  b. Shortlist:       result = laya.predict_shortlist(agent, state, questions,
+                                   embed_fn=laya.embed_fn_from_agent(agent), k=20)
+                      result["shortlist"]["intent"]["labels"]      # labels actually scored
+                      Probabilities are then over those k labels only.
+  c. Two questions:   a coarse group first, then a fine choice within the group.
+
+Measure on our data. One reporter saw Banking77 move from 54.3% to 60.8% with a top-20
+shortlist; the Laya team did not re-measure it.
+
+
+9. Hooks: logging, redaction, caching, metrics
+----------------------------------------------
+  def log(ctx):
+      print(ctx.model, ctx.results[0]["answers"], ctx.elapsed_ms, ctx.usage)
+
+  agent = laya.load("convaiinnovations/laya", on_predict_end=log)
+  router = Router(hooks=[MyAuditHook()], hooks_raise=False)    # telemetry must not fail calls
+
+Events: on_predict_start, on_predict_end, on_route, on_load, on_evict, on_error.
+Context fields: states, questions, run_id, results, decision, model, agent, router,
+max_len, head_max_len, usage, elapsed_ms, error.
+  - A start hook can rewrite ctx.states (redact PII here) or ctx.questions, set
+    ctx.max_len / ctx.head_max_len, or call ctx.skip(cached_results).
+  - An end hook can rewrite ctx.results.
+  - Process-wide defaults: laya.hooks.set_default_hooks / add_default_hook.
+Examples to copy: examples/hooks/audit.py, redact.py, cache.py, otel.py.
+Docs: docs/hooks/ (index, lifecycle, api, errors, patterns, tracing, examples).
+
+
+10. Confidence gating: automate only when sure
+----------------------------------------------
+  ans = result["answers"]["department"]
+  if ans["answer_confidence"] >= 0.85:
+      route_automatically(ans["choice"])
+  else:
+      escalate_to_human(ans["choice"], reason=f"low confidence {ans['answer_confidence']:.2f}")
+
+Three rules:
+  - Gate on answer_confidence. For choice and score questions the `confidence` field is an
+    entropy-based number that is not calibrated. (The README's own gating example uses
+    `confidence`; the code comments say not to compare the two against one threshold.)
+  - Fit temperatures on our own labelled data first. Shipped checkpoints are over-confident
+    (ECE 0.466 English, 0.314 multilingual, which ships with no fitted temperatures).
+  - Do not gate on action.act_probability; it carries no usable signal.
+
+LangChain note: LayaRouter(confidence_threshold=...) compares against `confidence`, so its
+threshold is on the entropy scale, not a probability. Set it from measured data.
+
+
+11. HTTP server for other services
+----------------------------------
+  pip install "laya[serve]"
+  LAYA_DEVICE=cuda LAYA_PRELOAD=1 laya-serve        # 0.0.0.0:8000, all checkpoints preloaded
+  LAYA_API_KEY=secret laya-serve                    # require "Authorization: Bearer secret"
+
+  curl -s localhost:8000/v1/systemone -H 'content-type: application/json' -d '{
+    "state": {"body": "billed twice, refund please"},
+    "questions": {"dept": {"type": "choice", "instructions": "which team?",
+                  "criteria": {"billing": "refunds", "tech": "bugs"}}}
+  }'
+  curl -s localhost:8000/health
+
+Environment: LAYA_HOST, LAYA_PORT, LAYA_DEVICE, LAYA_PRELOAD, LAYA_MODELS, LAYA_THREADS (keep
+at or below physical cores on CPU), LAYA_AUTO_TASK, LAYA_API_KEY, LAYA_LOG_LEVEL.
+
+Behaviour to plan around:
+  - One prediction at a time (one worker thread behind a lock). For more throughput, run
+    several instances or batch on the client side.
+  - Limits: 64 questions, 50,000 state characters, 2 MB body per request.
+  - Errors: 400 bad JSON or no "questions", 401 bad key, 413 body too large, 422 invalid
+    question (message names it), 500 inference failure (no internals leaked).
+  - Same wire format as TypeSafe Jev: a Jev client changes only its base URL.
+
+Web GUI for people to try it: python examples/server.py (http://127.0.0.1:8000, request
+builder, /predict, /predict/batch, /presets; --no-preload, --device).
+
+
+12. Docker
+----------
+  docker compose run --build --rm laya                                          # CPU sample
+  docker compose -f compose.yaml -f compose.cuda.yaml run --build --rm laya     # NVIDIA GPU
+
+compose.http.yaml adds the HTTP server as a second service. Weights are kept in a named
+volume. CPU needs about 8 GB RAM and 10 GB disk. ARM64 and DGX Spark: docs/docker-platforms.md.
+There is also a Nix flake: nix run .#laya-serve, and a NixOS module (services.laya-serve).
+
+
+13. LangChain and LangGraph
+---------------------------
+  from laya.integrations.langchain import LayaRouter, LayaGuardrail, LayaTriage, LayaEvaluator
+
+  route = LayaRouter(criteria={"billing": "invoices, charges", "tech": "bugs, outages"},
+                     confidence_threshold=0.80, fallback="human_agent")
+  workflow.add_conditional_edges("triage", route)
+
+  guard = LayaGuardrail(action="raise", threshold=0.5)    # raises LayaGuardrailError
+
+Each component takes agent= (in process), or base_url= and api_key= (a remote laya-serve, so
+edge clients need no torch). Remote calls refuse cross-origin and HTTPS-to-HTTP redirects.
+Docs: docs/langchain.md; example: examples/langchain_quickstart.py.
+
+
+14. MCP server
+--------------
+  pip install "laya[mcp]"
+  laya-mcp-server                          # or: python -m laya.mcp.server
+
+Tools: laya_status, laya_route, laya_predict, laya_preset. Environment: LAYA_DEVICE,
+LAYA_PRELOAD ("0" for lazy), LAYA_MODELS (MCP default "english,multilingual"), LAYA_THREADS.
+
+
+15. TypeScript (laya-ts)
+------------------------
+Runs on Node (CPU or CUDA) and in the browser (WebGPU, falling back to WASM). ESM-only.
+
+  # 1. export the weights once per checkpoint (verifies torch vs ONNX within 1e-4)
+  python laya-ts/scripts/export_onnx.py --model-dir <checkpoint dir> --out-dir ./model
+
+  # 2. build and test the package
+  cd laya-ts && npm install && npm run build && npm test && npm run test:package
+
+  // 3. use it
+  import { Agent, Router } from "laya-ts";
+  const agent = await Agent.load("./model");
+  const router = new Router();
+  router.attach("english", agent);
+  const out = await router.predict({ body: "charged twice" }, { intent: { type: "choice",
+      instructions: "What does the customer want?", criteria: { refund: "money back", other: "anything else" } } });
+
+The repository does not say the package is published on npm, so plan to build it from
+the repo.
+
+
+16. Fine-tuning on our own labels
+---------------------------------
+This is where the accuracy comes from (typed-decisions: 0.362 base to 0.766 fine-tuned).
+Notebook: notebooks/laya_finetune_typed_decisions_2xT4_kaggle.ipynb (Kaggle, free 2x T4,
+about 4 to 5 hours for 4 epochs over ~30k questions). It builds the dataset, trains with
+RLCD, fits one temperature per question type, evaluates and pushes to the Hub.
+Worked example: docs/finetune_browser_agent.md (one 16 GB GPU, element choice 0.10 to 0.66).
+
+Our steps:
+  1. Collect labelled decisions from real traffic.
+  2. Split: train / calibration / test. (The notebook calibrates on training items, so keep
+     a separate held-out test set.)
+  3. Fine-tune, fit temperatures on the calibration set.
+  4. Measure accuracy and ECE on the test set against the base checkpoint and our current
+     method.
+  5. Load the result with laya.load("./our_model") and gate on answer_confidence.
+
+
+17. Measuring Laya on our own data
+----------------------------------
+  - research/eval/laya_eval.py: per-language accuracy and calibration with per-case JSON
+    output (pip install laya datasets), e.g.
+      python research/eval/laya_eval.py --model convaiinnovations/laya --langs en,de --out report.json
+  - research/benchmarks/feishu_zh/run.py: a model-against-model runner with an offline
+    audit; it can also call Jev (billable, needs TYPESAFE_API_KEY).
+  - laya.ece_score(conf, correct) computes calibration error from our own results.
+
+
+18. Changing Laya itself (tests and rules)
+------------------------------------------
+  ruff check laya/ --select=E9,F63,F7,F82,F401,F811 --line-length=120
+  python -m compileall -q laya/ tests/
+  python tests/test_hooks_api.py          # public API contract; update it with any API change
+  python tests/test_router.py; python tests/test_criteria.py; python tests/test_hooks.py
+  python -m pytest tests/test_serve.py    # skipped without the serve extra
+GPU and checkpoint tests skip unless CUDA or ~/laya_models is present. Commits use prefixes
+such as feat(agent): or fix(router):. Do not reformat files.
+
+
+19. Suggested first steps for our team
+--------------------------------------
+  1. Install in a venv; run the CLI on five real examples.
+  2. Write the questions for one workflow and run Router.predict on 100 labelled cases.
+     Record accuracy and answer_confidence per case.
+  3. Compute ECE (laya.ece_score). If it is high, fit temperatures on half the cases.
+  4. Run the same cases through our current method (and Jev, if it is an option).
+  5. If Laya is weak zero-shot (likely, going by the repo's own results), plan a fine-tune
+     before deciding.
+  6. If it wins, serve it with laya-serve (several instances, or batching) or a LangChain
+     node, with a redaction start hook and a logging end hook.
+
+Which workflow to start with is our decision; it sets the questions, labels and checkpoint.
+
+
+Corrections from the first version of this file
+-----------------------------------------------
+  - Gating now uses answer_confidence; the old version used `confidence`, which is not
+    calibrated for choice and score questions.
+  - email_state signature confirmed: email_state(subject, body, sender=None, clean=True, **extra).
+  - Preset question IDs listed exactly; schema limits and the score/boolean rules added.
+  - Server: one prediction at a time, 2 MB body cap and error codes added.
+  - TypeScript: browser support, ESM-only and export verification added; no npm claim.
+  - Added devices and OOM fallback, lang_guess, auto_task_detection, the eval harness and
+    the LangChain threshold caveat.

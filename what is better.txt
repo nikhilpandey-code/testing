@@ -1,0 +1,215 @@
+WHAT IS BETTER
+==============
+(Re-checked on 2026-11-18. The re-check found a paired Laya-vs-Jev test that I had missed,
+and it changes the answer below. Corrections are listed at the end.)
+
+Short answer
+------------
+Neither is better everywhere. On the evidence in the repository:
+
+  - Out of the box, on a new business workflow, Jev (or a general LLM) is better. In the
+    only like-for-like test in the repository (64 Chinese workplace cases, real recorded
+    responses from both), Jev got 64/64 and the untuned Laya multilingual checkpoint got
+    20/64. Laya's own README says its base checkpoints are near chance on structured
+    business decisions and calls Laya "a fast base to specialise, not a zero-shot decision
+    engine".
+
+  - After fine-tuning on our own labelled data, Laya can be better: 0.766 against Jev's
+    published 0.727 on the typed-decisions benchmark. It is also faster on a GPU, free per
+    call, private, works offline, and gives usable calibrated probabilities once
+    temperatures are fitted.
+
+So the real question is not "which model is better" but "are we willing to label data and
+run our own model?" If yes, Laya is likely the better long-term choice for narrow,
+high-volume, sensitive decisions. If no, Jev or an LLM is better.
+
+"What is better" can mean two comparisons; this file covers both:
+  1. Laya versus TypeSafe Jev (details in "laya vs typesafe jev.txt").
+  2. Laya versus a general LLM used as a classifier. The repository does not measure this,
+     so that part is my reasoning from how the two are built.
+
+
+1. Laya versus Jev: scorecard
+-----------------------------
+  Criterion                               Laya                    Jev                Better
+  --------------------------------------  ----------------------  -----------------  ------
+  Accuracy, new workflow, no tuning       weak (20/64 paired;     strong (64/64      Jev
+                                          near chance on          paired)
+                                          typed-decisions)
+  Accuracy after fine-tuning              0.766 typed-decisions   0.727 published    Laya
+  Simple public datasets (AG News, emotion)  0.950, 0.595         0.910, 0.480       Laya
+  Many options (>20 labels)               0.425 Banking77         0.870              Jev
+  Option-order stability, 20 options      0.150 / 0.230 changed   0.13               Jev
+  Calibration as shipped                  over-confident          better raw ECE     Jev
+  Calibration after our own temp fit      ECE 0.081               0.246 (unknown     Laya
+                                                                  if fitted)
+  Speed, one question                     32.8 ms on a T4 GPU;    236-276 ms incl.   Laya on GPU;
+                                          150-415 ms on Apple M4  network            close on CPU
+  Same answer for the same input          yes, every repeat       63/64 or 64/64     Laya (slightly)
+  Cost at high volume                     own hardware only       per token          Laya
+  Data stays inside our network           yes                     no                 Laya
+  Per-language evidence                   51 languages measured   none published     Laya
+  Setup and operations                    ours (GPU, updates,     none               Jev
+                                          temperature fits)
+  Fine-tune on our labels                 yes, notebook provided  no                 Laya
+  Vendor support and SLA                  none (open source)      yes (check terms)  Jev
+  Licence                                 Apache 2.0              closed             Laya
+
+Reading the table: Laya wins more rows, but Jev wins the row that matters most on day one,
+accuracy without tuning. Laya's wins on accuracy only arrive after we invest in labels,
+fine-tuning and temperature fitting.
+
+Sources: README.md, BENCHMARKS.md and research/benchmarks/feishu_zh/results/v1/summary.json.
+Most Jev figures are third-party published numbers; only the Feishu test recorded real
+Jev responses. Neither set was run by us.
+
+
+2. Laya versus a general LLM (not measured in the repository)
+-------------------------------------------------------------
+Laya is better when:
+  - The answer is from a fixed small set (a department, a priority, yes/no) and we can
+    label examples to fine-tune.
+  - Volume is high. A forward pass costs a few to a few hundred milliseconds on our own
+    hardware, with no per-call fee.
+  - Data must not leave our network.
+  - We need a calibrated probability to decide "automate or escalate" (after fitting
+    temperatures, using the answer_confidence field).
+  - We need the same answer every time for the same input.
+  - It must run offline, at the edge, or in a browser.
+
+An LLM is better when:
+  - There is no labelled data yet, or the questions change often. Laya's untuned results
+    are weak, and an LLM can follow new instructions immediately.
+  - The task needs reasoning, world knowledge or long instructions.
+  - We need a written explanation for a human.
+  - Inputs are longer than Laya can read (512 tokens on the English checkpoint, up to 8,192
+    on multilingual with accuracy falling after about 4,000).
+  - Volume is low, so cost and latency do not matter.
+
+Common middle ground: use an LLM to label a few thousand examples, review a sample by hand,
+then fine-tune Laya on them for the high-volume path. The typed-decisions benchmark points
+the same way: its labels come from a teacher model (the README reports a "teacher
+self-agreement ceiling"), and the checkpoint fine-tuned on them beat that ceiling.
+
+
+3. A decision rule we can apply
+-------------------------------
+  Q1. Is the answer a small fixed set (under about 20 options)?
+      No  -> Jev or an LLM, or Laya with a shortlist step (measure it first).
+      Yes -> Q2.
+
+  Q2. Do we have, or can we create, a few hundred or more labelled examples?
+      No  -> Jev or an LLM for now. Start collecting labels from its output and human review.
+      Yes -> Q3.
+
+  Q3. Must the data stay inside our network, or is it regulated?
+      Yes -> Laya (fine-tuned). Jev and hosted LLMs are out.
+      No  -> Q4.
+
+  Q4. High volume (thousands a day or more) or strict latency?
+      Yes -> Laya (fine-tuned, on a GPU if latency matters).
+      No  -> Q5.
+
+  Q5. Do we have someone to run the model, re-fit temperatures and update it?
+      No  -> Jev (if its terms are acceptable).
+      Yes -> Laya, after a measured comparison on the same test set.
+
+This rule is my judgment from the documented results, not a rule from the Laya team.
+
+
+4. Better for each kind of task
+-------------------------------
+Support ticket routing (department, urgency, churn risk)
+  Good fit for Laya after fine-tuning: short text, few labels, high volume, personal data.
+  The shipped checkpoints scored only 0.50 to 0.52 on 10-way support triage, even though
+  that dataset was in their training mix, so do not ship untuned.
+
+Email spam and phishing
+  Laya is very strong (0.993 spam, 0.980 to 0.993 phishing, ECE about 0.01), but both
+  datasets were in its training data. Check on our own mail.
+
+Prompt-injection and jailbreak guardrails
+  0.708 to 0.762 on held-out jailbreak data. Useful as a fast first filter in front of an
+  LLM, not a complete defence.
+
+Content moderation
+  Weak (0.530 on held-out toxic-chat, near chance on a balanced split). Use a dedicated
+  moderation model or an LLM, plus human review.
+
+Work-chat triage in Chinese (urgent / todo / valuable / noise)
+  Untuned Laya is clearly worse than Jev (20/64 vs 64/64) and wrongly created tasks for
+  22 of 32 non-action messages. Needs fine-tuning before any use.
+
+Large catalogues (50+ labels)
+  Laya's token budget is the bottleneck (Banking77 0.425 vs Jev 0.870). Jev or an LLM with
+  retrieval is better today; a Laya shortlist might close part of the gap (untested by us).
+
+Ordinal ratings (1 to 5 stars and similar)
+  Laya's weakest question type (SST-5 0.372). Prefer a choice question with clear labels, or
+  another method.
+
+Many languages
+  Laya has measured results for 51 languages (45 usable with routing). Routing is essential:
+  the English checkpoint collapses on other scripts. Jev has no published per-language data,
+  but it won the one Chinese test.
+
+Agent tool and element choices (browser agents)
+  A documented fine-tune took element choice from 0.10 to 0.66 at 17 to 23 ms per step. A
+  good fit when we can generate training data.
+
+
+5. Things the Laya documentation is cautious about
+-------------------------------------------------
+  - Base checkpoints are near chance on structured business decisions. Fine-tuning is the
+    product.
+  - Shipped confidence is over-confident. Fit temperatures, and gate on answer_confidence:
+    the `confidence` field on choice and score answers is an entropy measure, not a
+    calibrated probability (the README's gating example and the LangChain router use it).
+  - act_probability carries no usable signal.
+  - noul answers can follow their label wording (issue #156); score questions on the
+    multilingual checkpoint rarely pick the first level (issue #131).
+  - Never send non-English text to the English checkpoint.
+
+
+6. Risks and unknowns to check before committing
+------------------------------------------------
+  - Our own accuracy and calibration on our own labelled data. Nothing above replaces it.
+  - Jev's and the LLM's accuracy on the same data, so we compare like with like.
+  - Total cost of running Laya: hardware, hosting, monitoring, labelling, fine-tuning, and
+    re-fitting temperatures when the data drifts. laya-serve handles one request at a time,
+    so capacity needs several instances or batching.
+  - Project maturity: version 0.3.20, marked Beta, a small open-source team. Check the release
+    cadence and open issues before depending on it.
+  - Model card terms for the checkpoints on Hugging Face (the code is Apache 2.0).
+  - Jev's current price, terms, SLA and data policy. I did not check these.
+
+
+7. My recommendation
+--------------------
+Do not choose before one measured test, and expect the answer to differ per workflow.
+
+  1. Pick one real workflow with a clear label set (support triage is a good candidate).
+  2. Build a labelled set from our data; keep a held-out test set aside.
+  3. Run on the same test set:
+       a. Laya Router, untuned (the baseline we expect to be weak).
+       b. Laya fine-tuned on our training set, with temperatures fitted on a calibration set.
+       c. Our current method, and Jev or an LLM if they are options.
+  4. Compare accuracy, false actions, ECE (on answer_confidence), latency on our real
+     hardware, and cost per 1,000 decisions.
+  5. Choose Laya for that workflow only if (b) is at least as accurate as the best
+     alternative and the cost, privacy or latency requirements favour it.
+
+My expectation from the repository's evidence: untuned Laya loses, fine-tuned Laya can win
+on narrow high-volume workflows, and Jev or an LLM stays better for many-label or
+fast-changing tasks. That expectation needs our own measurement.
+
+
+Corrections from the first version of this file
+-----------------------------------------------
+  - The first version said Laya "wins most rows" and treated accuracy on few options as a
+    tie. The paired Feishu test (Jev 64/64, untuned Laya 20/64) shows Jev is clearly better
+    without tuning. The answer now depends on fine-tuning.
+  - "Multilingual: Jev no data" is changed: Jev won the one Chinese test.
+  - Speed now notes hardware: 32.8 ms is a T4 GPU; on an Apple M4 Laya took 150 to 415 ms.
+  - Gating advice now uses answer_confidence.
+  - Added the "LLM labels, Laya serves" middle ground and the triage zero-shot numbers.
