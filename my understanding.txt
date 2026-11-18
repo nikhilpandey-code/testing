@@ -1,0 +1,194 @@
+MY UNDERSTANDING OF LAYA
+=========================
+
+Short version
+-------------
+Laya is a small, local, on-device "System 1" decision engine. You give it a piece of
+text (or a JSON document) plus a set of typed questions, and it answers all of them in
+one forward pass of a neural network, with no text generation. It is multilingual
+(100+ languages) and it returns calibrated probabilities, not just a label.
+
+It is published as the Python package `laya` (version 0.3.20, Apache-2.0, by Convai
+Innovations), with a TypeScript port called `laya-ts` (version 0.1.0) in the same repo.
+
+
+What problem it solves
+----------------------
+Many apps need to make quick, structured decisions about incoming text:
+  - Which department should handle this ticket?           (billing / technical / other)
+  - How urgent is this?                                    (not urgent / soon / critical)
+  - Does this user threaten to cancel?                     (yes / no, with a probability)
+  - Is this message safe, or does it need moderation?      (guardrails)
+
+Doing this with an LLM that generates text is slow, costs money, and can produce output
+that has to be parsed and may hallucinate. Laya instead reads the input once and scores
+the answer options directly. The README quotes about 33 ms for one question on a T4 GPU,
+and about 7 ms per question when batched.
+
+
+The three question types
+------------------------
+Every question has an `instructions` string and a type:
+  - choice : pick one option from a labelled set (criteria is a dict of label -> description)
+  - score  : pick one level from an ordered list (criteria is a list, low to high)
+  - noul   : a yes/no question, returning the probability the answer is yes
+             (the answer labels default to false/true and can be customised with `labels`)
+
+The result is a dict of answers per question, with the probabilities or confidence attached.
+
+
+The three checkpoints and the Router
+------------------------------------
+Laya ships three model checkpoints, all hosted on Hugging Face under the bundle
+convaiinnovations/laya:
+  - english          ModernBERT-large, 421M params, 512-token context. Best for English.
+  - multilingual     mmBERT-base, 322M params, 1024 tokens (up to 8192 with max_len).
+                     Best for 100+ languages.
+  - typed-decisions  ModernBERT-large, 421M params, fine-tuned on four specific synthetic
+                     workflows. Never picked automatically unless you opt in.
+
+The `Router` is the recommended entry point. It looks at the text, detects the script and
+language with a small dependency-free detector (lang.py), and sends the request to the
+right checkpoint. The key observation in the docs is that the English checkpoint
+"collapses" on non-Latin scripts (for example it scores 0.000 on Khmer while being
+confident), so script detection is the main routing signal. Routing only needs to answer
+"can the English checkpoint read this?".
+
+The Router keeps up to two checkpoints loaded by default (LRU eviction), can preload them,
+can route whole batches (`predict_batch`), and has a `route()` method that tells you which
+checkpoint would be used without loading any model.
+
+
+How it works inside (from the code)
+-----------------------------------
+  1. Input: a state (string, dict or list) and a dict of questions.
+  2. Sequence building (common.py, build_sequence):
+       [CLS] <type> question: <instructions> [SEP] [MASK] opt0 [MASK] opt1 ... [SEP] state [SEP]
+     The question and its options are placed in front of the state, so the encoder reads the
+     question first. The state is serialised to JSON if it is not a string. A head budget
+     (head_max_len, default 192 tokens) keeps the options from being cut off.
+  3. Encoder: a bidirectional transformer (ModernBERT-style, or mmBERT for multilingual).
+  4. Decision head (DecisionModel in common.py): a small 2-layer transformer on top of the
+     encoder, with a question-type embedding added, and a scorer that gives one logit per
+     option (for choice and score) or a yes/no pair (for noul). There is also a separate
+     small "act" head (act_head, two outputs) that I did not fully trace.
+  5. Calibration: per question-type temperatures (clamped between 0.5 and 5.0) turn the
+     logits into probabilities. confidence_from_probs and ece_score in common.py measure
+     and report calibration.
+  6. Training: reinforcement learning with strictly proper scoring rules (called RLCD in the
+     README). The reward (proper_reward in common.py) is a sum of a log score, a spherical
+     score and a ranked probability score, so the model is pushed to report honest
+     probabilities. td_lambda_targets is also in common.py.
+
+Practical extras built on top:
+  - Long documents: the multilingual checkpoint can read up to 8192 tokens (README table).
+  - Large option lists: shortlist.py picks the top k options with an embedding function
+    before running the real prediction, so a 200-label choice does not starve the context.
+  - Email cleaning (email.py): strips quoted replies, sign-offs and disclaimers in English,
+    Portuguese and Spanish before the text reaches the model.
+  - Schema-driven decisions (structured.py): turn a JSON Schema or a Pydantic model into
+    questions, and get typed values back (enum -> choice, boolean -> noul, bounded integer
+    -> score). Free strings, arrays and nested objects are rejected on purpose.
+  - Presets (presets.py): ready-made question sets: triage, email, guard, moderation, router.
+
+
+Where it can be used
+--------------------
+  - In Python, in process:       `from laya import Router`  (and `Agent`, `load`, `decide`)
+  - From the command line:       `laya "text"`, `laya "text" --predict`, `laya --preset triage`
+  - As an HTTP server:           `laya-serve`, which exposes POST /v1/systemone (compatible
+                                 with the TypeSafe Jev decision API wire format), GET /health,
+                                 optional bearer key (LAYA_API_KEY). Configured through env vars.
+  - As an MCP tool server:       `laya-mcp-server` (optional extra `laya[mcp]`), with tools
+                                 for status, route, predict and presets, for MCP clients such
+                                 as Claude Desktop.
+  - LangChain / LangGraph:       laya/integrations/langchain.py gives components named
+                                 LayaRouter, LayaGuardrail (raises LayaGuardrailError),
+                                 LayaTriage and LayaEvaluator. They work in-process or
+                                 against a remote laya-serve over HTTP.
+  - Fast GPU path:               laya/fast.py (TileLang kernels in tl_kernels.py, bf16,
+                                 CUDA graphs), optional extra `laya[fast]`.
+  - ONNX runtime:                laya/onnx_agent.py, optional extra `laya[onnx]`.
+  - TypeScript / Node:           laya-ts, a port of the core pieces (tokenizer, sequence
+                                 building, router, hooks, language detection, presets, email),
+                                 with ONNX Runtime as the model backend. Its tests live in
+                                 laya-ts/tests.
+  - Docker:                      Dockerfile, compose files (CPU, CUDA, DGX Spark) and docs.
+  - Notebooks:                   a fine-tuning notebook for Kaggle 2x T4 GPUs.
+
+
+Extensibility: hooks
+--------------------
+hooks.py lets you observe or change every prediction without forking Laya: on_predict_start
+and on_predict_end, plus per-request or default hooks. examples/hooks/ has working samples:
+audit logging, caching, redaction (rewrites the state before the model sees it), and
+OpenTelemetry tracing.
+
+
+Repository layout (what is where)
+---------------------------------
+  laya/                  the Python package (about 5,000 lines of core code)
+    agent.py             Agent: the runtime that loads one checkpoint and runs predict,
+                         predict_batch, system_one, decide. Also RLAgent and load().
+    common.py            model architecture, sequence building, reward, calibration helpers
+    router.py            Router: chooses and caches checkpoints, batches requests
+    lang.py              script and language detection, no dependencies
+    structured.py        JSON Schema / Pydantic -> questions and typed values
+    presets.py           ready-made question sets
+    email.py             email body cleaning
+    shortlist.py         embedding-based pre-selection for many options
+    hooks.py             prediction hooks
+    serve.py             FastAPI/uvicorn HTTP server
+    cli.py               the `laya` command
+    fast.py, tl_kernels.py   GPU fast path
+    onnx_agent.py        ONNX backend
+    mcp/                 MCP stdio server (server.py, tools.py, device.py)
+    integrations/        LangChain / LangGraph components
+  laya-ts/               TypeScript/Node port (src/, tests/, examples/, scripts/)
+  research/              benchmarks, evaluation harness (research/eval), feishu_zh benchmark,
+                         result JSON files, plot and benchmark scripts
+  tests/                 about 46 test files (plain scripts and pytest); some need CUDA or
+                         checkpoints under ~/laya_models and are skipped otherwise
+  docs/                  documentation site (built with zensical.toml): index, hooks guides, reference, Docker,
+                         LangChain, structured decisions, fine-tuning example
+  examples/              server.py (a self-contained FastAPI web GUI + JSON API),
+                         langchain_quickstart.py, hooks examples, docker quickstart
+  benchmarks/, assets/, notebooks/, scripts/, docker/, nix/
+  pyproject.toml         packaging, optional extras (serve, fast, mcp, onnx, langchain)
+  AGENTS.md / CONTRIBUTING.md   contribution rules (see below)
+
+
+Rules the project sets for itself (from AGENTS.md and CONTRIBUTING.md)
+-----------------------------------------------------------------------
+  - Laya must run locally. No dependency on a hosted service or external API in the core.
+    A feature that needs a hosted backend belongs in a separate integration.
+  - Do not change the public API without updating tests/test_hooks_api.py, which is the
+    API contract.
+  - Before a change is done, run:
+        ruff check laya/ --select=E9,F63,F7,F82,F401,F811 --line-length=120
+        python -m compileall -q laya/ tests/
+  - Do not reformat files or reorder imports. Match the style of the file you edit.
+  - Commit messages follow conventional prefixes such as feat(agent):, fix(router):,
+    perf(common):, docs(hooks):, test(batch):. One logical change per commit.
+  - Pull requests are written in English and should be rebased on main.
+  - If a change moves numbers (accuracy, latency, memory), report the before and after.
+
+
+Where this sits relative to your project
+----------------------------------------
+This folder ("laya testing") is a git repository on branch testing-branch, with one
+commit history. The Laya project itself lives in the subfolder laya/. The .DS_Store file
+at the top is only macOS clutter.
+
+I did not find a plan file for your work inside the repository. If your plan is in another
+file or in a message, please share it so I can match the next steps to it.
+
+
+What I did and did not check
+----------------------------
+  - I read the README, AGENTS.md, CONTRIBUTING.md, pyproject.toml, the docs index, the
+    module docstrings of every Python module under laya/, the export list of every
+    TypeScript source file in laya-ts/src/, and the core functions in common.py, router.py,
+    agent.py, structured.py and serve.py.
+  - I did not read every line of the 9,000+ lines of code, and I did not run the tests,
+    the server, or any model. Everything above is from reading the code and docs.
