@@ -222,10 +222,15 @@ conversation trajectories, so earlier turns get credit from the final outcome.
 
 Fine-tuning is the main way to get accuracy. On the typed-decisions benchmark (2,000
 decisions) the base English checkpoint scores 0.362, below the 0.461 majority-class
-baseline, and the fine-tuned checkpoint scores 0.766. The Kaggle notebook (2x T4, about 4 to
-5 hours for 4 epochs over ~30k questions) trains, fits one temperature per question type,
-and removes old per-bucket temperatures so they do not override the new fit. Its calibration
-samples come from the training items, so evaluate on separate held-out data.
+baseline, and the fine-tuned checkpoint scores 0.766. The Kaggle notebook (2x T4) trains for
+4 epochs, holds out min(400, 10%) of the items for calibration, fits one temperature per
+question type on them, and removes old per-bucket temperatures so they do not override the
+new fit. (The README says the notebook calibrates on training items; the current notebook
+code holds a slice out. The README also gives 4 to 5 hours of runtime, while the notebook
+says about 4 to 6 minutes for its 6,000 decisions.) Details: "laya fine-tuning guide.txt".
+
+Note: in that training script the act head gets no gradient (its output is added to the
+loss multiplied by 0.0), which is consistent with act_probability carrying no signal.
 
 
 8. What comes back

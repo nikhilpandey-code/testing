@@ -345,14 +345,17 @@ the repo.
 ---------------------------------
 This is where the accuracy comes from (typed-decisions: 0.362 base to 0.766 fine-tuned).
 Notebook: notebooks/laya_finetune_typed_decisions_2xT4_kaggle.ipynb (Kaggle, free 2x T4,
-about 4 to 5 hours for 4 epochs over ~30k questions). It builds the dataset, trains with
-RLCD, fits one temperature per question type, evaluates and pushes to the Hub.
+4 epochs; the notebook says about 4 to 6 minutes for its 6,000 decisions, the README says
+4 to 5 hours for ~30k questions). It builds the dataset, trains with RLCD, holds out a
+calibration slice and fits one temperature per question type, evaluates and can push to the
+Hub. Full walkthrough: "laya fine-tuning guide.txt".
 Worked example: docs/finetune_browser_agent.md (one 16 GB GPU, element choice 0.10 to 0.66).
 
 Our steps:
   1. Collect labelled decisions from real traffic.
-  2. Split: train / calibration / test. (The notebook calibrates on training items, so keep
-     a separate held-out test set.)
+  2. Split: train / test, and keep the test set out of the notebook entirely. (The notebook
+     holds out its own calibration slice from the training data, but it evaluates on the
+     benchmark's test split, so we must supply our own.)
   3. Fine-tune, fit temperatures on the calibration set.
   4. Measure accuracy and ECE on the test set against the base checkpoint and our current
      method.

@@ -1,0 +1,219 @@
+LAYA QUESTION DESIGN GUIDE
+==========================
+How to write questions that Laya answers well. The wording of the question and options
+is part of the model input, so it decides accuracy more than almost anything else we
+control. Facts here come from laya/common.py, laya/agent.py, laya/presets.py, the README's
+"Honest limits" and BENCHMARKS.md (checked 2026-11-18). Advice marked "(advice)" is my
+recommendation, not something the repository measured.
+
+
+1. What the model actually sees
+-------------------------------
+Each question becomes its own sequence:
+
+  [CLS] choice question: <instructions> [SEP]
+        [MASK] label_a: description a [MASK] label_b: description b ... [SEP]
+        <state as text or JSON> [SEP]
+
+Consequences:
+  - The question and every option are read BEFORE the state, and they share a fixed token
+    budget (head_max_len: 192 on the English checkpoint, 256 on multilingual and
+    typed-decisions).
+  - Each option is cut to 48 tokens. If all options still do not fit, each is cut further
+    (to a minimum of 4 tokens). Long descriptions are wasted.
+  - Label keys are shown to the model verbatim. A key is not just an ID; it is part of the
+    text the model reads.
+  - The state gets what is left: about 320 tokens on the English checkpoint, about 768 on
+    the others (more with max_len). Text past that is cut.
+  - Every question is a separate row in the forward pass. More questions cost more time
+    (English checkpoint on a T4: 39.5 ms for 1 question, 158.6 ms for 10).
+
+
+2. Pick the right question type
+-------------------------------
+  Use choice when      the answer is exactly one of a few named categories.
+                       Example: department = billing / technical / sales / other.
+  Use noul when        the answer is yes or no and we want P(yes).
+                       Example: "Does the customer ask for money back?"
+  Use score when       the answer is a level on an ordered scale and "near misses" matter.
+                       Example: frustration = calm / concerned / annoyed / very angry.
+
+Rules of thumb:
+  - Several independent yes/no facts: ask several noul questions, not one choice with
+    combined options. (The triage preset asks is_urgent, refund_requested and churn_risk
+    separately.)
+  - Score is the weakest type (SST-5: 0.372), and the multilingual checkpoint rarely picks
+    the first level (issue #131). If the levels are really categories, use choice.
+  - If a noul question behaves strangely on the English checkpoint (it can follow its
+    "false:"/"true:" wording instead of the text, issue #156), rewrite it as a two-option
+    choice with neutral keys (see section 6).
+
+
+3. Writing instructions
+-----------------------
+  - One decision per question. "Is this urgent and about billing?" is two questions.
+  - Name the field you mean when the state is a dict. The shipped presets do this:
+      "What does the customer want in `message`?"
+      "Does `message` communicate time pressure or a deadline?"
+  - Be concrete: "Does the customer ask for money back?" beats "Refund?".
+  - Keep it short. The instructions share the head budget with the options; when space is
+    tight they are cut first (down to 8 tokens).
+  - Language (advice): the repository's multilingual benchmarks use English instructions
+    with non-English states. Keep instructions in English unless we measure that another
+    language works better.
+
+
+4. Writing choice options
+-------------------------
+Format: "criteria": {"label": "short description", ...}, or a plain list of labels.
+
+  - Use meaningful snake_case labels, as the presets do: refund, technical_help,
+    billing_question, information, cancellation, other.
+  - Never use "true", "false", "yes" or "no" as choice labels. The current checkpoints can
+    follow the label word instead of the description (README, Honest limits). Use real names,
+    or neutral keys "A", "B" with the meaning in the description.
+  - Keep descriptions short and distinctive: a few words that separate this option from the
+    others, e.g. "refund": "money returned or a duplicate charge reversed".
+  - Make options mutually exclusive, and add a catch-all: "other": "none of the other
+    options fits".
+  - Keep the count small. Accuracy holds up to roughly 20 options; above that the token
+    budget runs out (Banking77, 77 labels: 0.425). The budget per option when space is tight
+    is (head_max_len - 16) / number_of_options tokens, with a minimum of 4, and that count
+    includes the option's own [MASK] marker:
+        options   English (192)   multilingual/typed (256)
+        5         35 tokens       48 tokens (the per-option cap)
+        10        17              24
+        20        8               12
+        50        3 (min is 4)    4
+        77        2 -> 4 min      3 -> 4 min
+    If the options cannot fit within max_len at all, Laya raises
+    "question 'x' options exceed head_max_len=..." rather than answering.
+  - Above about 20 options, pick one of:
+      a. raise the budget: predict(..., head_max_len=512, max_len=1024)
+      b. predict_shortlist(..., k=20) with an embedding function
+      c. split into a coarse question then a fine one (e.g. area -> exact intent)
+  - Order: options are scored in the order given, and at 20 options the answer changes in
+    15% (English) to 23% (multilingual) of cases when the order is shuffled. Test it (see
+    section 9).
+
+
+5. Writing score levels
+-----------------------
+Format: "criteria": ["level 0 text", "level 1 text", ...], lowest first.
+
+  - Order from least to most, as the preset does:
+      ["calm and neutral", "concerned but civil", "clearly annoyed",
+       "very angry or using strong language"]
+  - Use 3 to 5 levels with concrete anchors. "1", "2", "3" with no text gives the model
+    nothing to compare against. (advice)
+  - Know what you get back: answers[qid]["score"] is the expected level (for example 1.84),
+    not a level. decide() returns the most likely level (argmax) instead. Pick one and use
+    it consistently.
+  - On non-English text the multilingual checkpoint seldom chooses level 0. Validate on our
+    data, or ask a noul question for the lowest level ("Is the customer calm?").
+
+
+6. Writing noul (yes/no) questions
+----------------------------------
+Format: {"type": "noul", "instructions": "...", optional "criteria", optional "labels"}
+
+  - Phrase the question so that "yes" is the event we act on:
+    "Does the user threaten to cancel?" rather than "Is the user happy to stay?".
+  - criteria may only use the keys "true" and "false" (anything else is rejected):
+      "criteria": {"true": "yes, the review is positive", "false": "no, the review is negative"}
+  - labels changes only the wording the model sees, not the meaning:
+      "labels": {"true": "A", "false": "B"}
+    The answer is always P(true). The README suggests this exact pattern when the English
+    checkpoint follows its default labels.
+  - Alternative that avoids the issue: a two-option choice with neutral keys:
+      {"type": "choice", "instructions": "Is this review positive?",
+       "criteria": {"A": "yes, the review is positive", "B": "no, the review is negative"}}
+  - Thresholds: decide() treats P(true) >= 0.5 as True. For actions with a cost, pick the
+    threshold from data (e.g. only auto-refund above 0.9).
+
+
+7. Designing the state
+----------------------
+  - Prefer a dict with meaningful keys: {"subject": ..., "body": ..., "from": ...}. Keys
+    become part of the JSON the model reads, and instructions can refer to them.
+  - Include only fields that matter for the decision. Everything costs tokens; IDs,
+    timestamps and HTML waste the state budget. (advice)
+  - Put the important content first. Strings and dicts are truncated from the END.
+  - Conversations: pass a list of turns oldest first. Lists are truncated from the START,
+    so the newest turn survives.
+  - Emails: use laya.email_state(subject, body, sender) to strip quoted history,
+    signatures and disclaimers (English, Portuguese, Spanish markers) and cap the body at
+    3,000 characters.
+  - The [MASK] token is removed from state text automatically; no escaping needed.
+  - Long documents: multilingual with max_len=8192 reads up to 8,192 tokens, with accuracy
+    strong up to about 4,000 tokens of text and more variable beyond.
+
+
+8. Many questions on one state
+------------------------------
+  - Send them in one predict call: the state is tokenised once and all questions run in
+    one forward pass.
+  - Use stable question IDs. With Router(auto_task_detection=True) an exact match of the
+    question IDs to a typed-decisions workflow switches checkpoints (e.g. customer service
+    = action, category, churn_risk, needs_human, urgency). Avoid those exact ID sets unless
+    that is what we want.
+  - Schema mode (decide) is a convenient alternative: enum -> choice, boolean -> noul,
+    integer with minimum and maximum -> score. Limits: 32 fields, 32 enum values, 10 levels.
+    Put the question text in each field's "description".
+
+
+9. Test a question before relying on it
+---------------------------------------
+For each new question, on 50 to 100 labelled examples (advice):
+  1. Accuracy and answer_confidence per example (not the `confidence` field, which is not
+     calibrated for choice and score).
+  2. Order test: shuffle the options several times; count how often the answer changes.
+  3. Label test: rename the keys (e.g. "billing" -> "A") and compare; a big change means
+     the model is reading the label, not the description.
+  4. Paraphrase test: two wordings of the instructions; answers should agree.
+  5. Language test: if traffic is multilingual, include each main language.
+  6. Length test: check that long states still contain the deciding text after truncation.
+The repository has tools for 2 and 3 on its benchmark data (research/eval/metamorphic.py:
+option permutation and label variants; research/eval/presentation_checks.py: checks for
+score-slot bias). They can serve as references for our own checks.
+
+
+10. Before and after examples
+-----------------------------
+Weak:
+  {"type": "choice", "instructions": "Classify",
+   "criteria": {"yes": "", "no": "", "maybe": ""}}
+  Problems: vague instruction, boolean-word labels, no descriptions, no catch-all.
+
+Better:
+  {"type": "noul", "instructions": "Does `body` ask for money back?"}
+
+Weak:
+  {"type": "choice", "instructions": "Which of our 80 product intents is this?",
+   "criteria": {... 80 labels ...}}
+  Problem: about 3 tokens per option; options become indistinguishable.
+
+Better:
+  {"area":   {"type": "choice", "instructions": "Which area is `body` about?",
+              "criteria": {"payments": "...", "account": "...", "orders": "...", "other": "..."}}}
+  then a second call with only that area's intents (or predict_shortlist with k=20).
+
+Weak:
+  {"type": "score", "instructions": "Urgency 1-5", "criteria": ["1", "2", "3", "4", "5"]}
+
+Better:
+  {"type": "score", "instructions": "How urgent is the request in `body`?",
+   "criteria": ["no time pressure", "within a few days", "today", "blocking work right now"]}
+
+
+11. Checklist
+-------------
+  [ ] One decision per question; instruction names the state field.
+  [ ] Right type (choice / noul / score); score only for truly ordered levels.
+  [ ] Choice labels are meaningful, not true/false/yes/no; short descriptions; catch-all.
+  [ ] 20 options or fewer, or a plan (budget, shortlist, two-step).
+  [ ] noul phrased so "yes" is the action; criteria keys only true/false.
+  [ ] State has only useful fields, important content first; emails cleaned.
+  [ ] Gating uses answer_confidence, with thresholds from our data.
+  [ ] Order, label and paraphrase tests run on labelled examples.
+  [ ] The final wording is frozen before fine-tuning (the model learns that exact wording).

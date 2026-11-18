@@ -1,0 +1,253 @@
+LAYA DEPLOYMENT GUIDE
+=====================
+How to run Laya in production. Facts come from laya/serve.py, laya/router.py, laya/agent.py,
+compose.http.yaml, docs/docker.md, nix/laya-serve.nix and the README (checked 2026-11-18).
+Recommendations are marked "(advice)". Nothing here has been run.
+
+
+1. Ways to deploy
+-----------------
+  In-process library    Router or Agent inside our own Python service. Lowest latency, no
+                        network hop; our service then needs torch and the model memory.
+  laya-serve (HTTP)     A small FastAPI server with the Jev-compatible POST /v1/systemone.
+                        Any language can call it; Jev clients only change the base URL.
+  Docker                The repository's image runs laya-serve (compose.http.yaml) on CPU or
+                        NVIDIA GPUs; ARM64 and DGX Spark builds are documented.
+  Nix / NixOS           A flake with a NixOS module: services.laya-serve.
+  MCP server            laya-mcp-server, for AI assistants and agents (stdio).
+  LangChain remote      LayaRouter / LayaGuardrail / LayaTriage / LayaEvaluator with
+                        base_url pointing at our laya-serve, so edge clients need no torch.
+  TypeScript            laya-ts on Node or in the browser from an ONNX export.
+
+Recommendation (advice): laya-serve in Docker behind our own API gateway, several replicas,
+API key set, TLS at the proxy. In-process only when one Python service is the sole user.
+
+
+2. Performance numbers to plan with (from the README; not measured by us)
+-------------------------------------------------------------------------
+  GPU (T4), model loaded:   32.8 ms (multilingual) / 39.5 ms (english) for 1 question;
+                            72.3 / 158.6 ms for 10 questions; 103 to 332 questions per
+                            second batched
+  CPU, model loaded:        about 193 to 464 ms per request
+  Apple M4 (MPS, float32):  150 ms (1 choice question) / 415 ms (4 yes/no questions) in the
+                            Chinese workplace benchmark
+  Cold load of a checkpoint: seconds (README: 7.4 s median rebuild on CPU)
+  First download:           needs Hugging Face access; the multilingual files are ~678 MB
+  CPU quickstart container: about 8 GB RAM and 10 GB disk
+  GPU memory: not documented per checkpoint; measure (advice).
+Measure on our own hardware with our own question set before sizing.
+
+
+3. laya-serve configuration
+---------------------------
+Install: pip install "laya[serve]"; start: laya-serve (or python -m laya.serve).
+
+  Variable          Default (pip)   Meaning
+  ----------------  --------------  ------------------------------------------------------
+  LAYA_HOST         0.0.0.0         bind address (all interfaces!)
+  LAYA_PORT         8000            port
+  LAYA_DEVICE       auto            torch device: cuda, cuda:0, cpu, mps
+  LAYA_PRELOAD      1               build checkpoints at startup, before binding
+  LAYA_MODELS       (all three)     comma list to preload, e.g. english,multilingual
+  LAYA_THREADS      torch default   CPU threads; keep at or below physical cores
+  LAYA_AUTO_TASK    0               auto-route to typed-decisions on matching question IDs
+  LAYA_API_KEY      none            if set, require Authorization: Bearer <key>
+  LAYA_LOG_LEVEL    info            uvicorn log level
+  HF_TOKEN          none            only for private or gated model repos
+  HF_HOME           ~/.cache/huggingface   where weights are cached
+  HF_HUB_OFFLINE    0               1 = use only cached weights (air-gapped hosts)
+  LAYA_CPU_AMP      off             bf16 on CPU (only on CPUs with native BF16)
+
+Endpoints:
+  POST /v1/systemone   body {"state": ..., "questions": {...}, "model": optional}
+  GET  /health         {"status": "ok", "loaded": [names], "device": LAYA_DEVICE or "auto"}
+
+Request limits: at most 64 questions, 50,000 state characters, 2 MB body.
+Errors: 400 (bad JSON or no "questions"), 401 (bad or missing key), 413 (too large),
+422 (invalid question; message names it), 500 ("inference failed", no internals leaked).
+
+The "model" field is honoured only for english, multilingual or typed-decisions; any other
+value (e.g. a Jev model ID) is ignored and the router chooses.
+
+
+4. Concurrency and scaling
+--------------------------
+laya-serve runs ONE prediction at a time: one worker thread behind an async lock. A slow
+CPU request delays every other request. Plan capacity accordingly:
+  - Run several replicas behind a load balancer (each replica loads its own models, so
+    memory scales with replicas) (advice).
+  - On a GPU, prefer fewer replicas with batching: callers can send many items through the
+    Python API's predict_batch, but laya-serve itself accepts one state per request
+    (advice: for bulk jobs, run a batch worker in process instead of many HTTP calls).
+  - LAYA_THREADS per replica x replicas should not exceed physical cores on a CPU host.
+  - Preload (LAYA_PRELOAD=1, the pip default) so no request pays a cold load. In
+    compose.http.yaml the default is LAYA_PRELOAD=0, so set it to 1 for production.
+  - Set LAYA_MODELS to the checkpoints actually needed (usually english,multilingual) to
+    save memory and startup time.
+
+
+5. Security
+-----------
+  - The pip default binds 0.0.0.0 with NO authentication. Always set LAYA_API_KEY (or
+    LAYA_API_KEY_FILE in Docker, apiKeyFile in Nix) before exposing the port.
+  - Docker Compose publishes on 127.0.0.1 unless LAYA_BIND_ADDRESS says otherwise; the
+    NixOS module binds 127.0.0.1 by default. Keep it that way and expose through a reverse
+    proxy with TLS (docs/docker.md says the same).
+  - Secrets: use the *_FILE variables with mounted files (Docker secrets, Kubernetes
+    Secret volumes). Never bake tokens into images or pass them as build arguments.
+  - The container runs as UID/GID 10001; mounted folders must be readable (and the model
+    cache writable) by that user.
+  - Key comparison is constant-time, and 500 errors do not leak paths or tracebacks.
+  - Request size limits (section 3) protect memory, but add rate limits at the proxy
+    (advice).
+  - Data: text never leaves the host unless our hooks send it somewhere. Log carefully
+    (section 8).
+
+
+6. Docker
+---------
+  # HTTP service, CPU
+  docker compose -f compose.yaml -f compose.http.yaml up --build -d laya-serve
+  # NVIDIA GPU
+  docker compose -f compose.yaml -f compose.http.yaml -f compose.cuda.yaml up --build -d laya-serve
+
+  curl -s localhost:8000/health
+  curl -s localhost:8000/v1/systemone -H 'content-type: application/json' \
+       --data @examples/docker/request.json
+
+Key points from compose.http.yaml and docs/docker.md:
+  - Weights live in a named volume (model-cache) shared with the quickstart service.
+  - A healthcheck polls /health every 30 s with a 10-minute start period (the first boot
+    downloads weights).
+  - restart: unless-stopped; init: true.
+  - Build arguments LAYA_TORCH_INDEX (cpu, cu128, cu130) and LAYA_TORCH_VERSION (2.14.0)
+    choose the PyTorch build; runtime variables cannot change it.
+  - GPU: needs the NVIDIA Container Toolkit; LAYA_GPU_ID picks the device.
+  - ARM64 hosts and DGX Spark: docs/docker-platforms.md.
+  - docker compose down keeps the weights; down --volumes deletes them.
+
+
+7. Serving a fine-tuned checkpoint with laya-serve
+-------------------------------------------------
+laya-serve has no environment variable for a custom checkpoint path (LAYA_MODEL_PATH in
+docs/docker.md applies to the one-shot quickstart). A small launcher works because
+laya.serve.create_app accepts a ready Router (sketch, not run):
+
+  # serve_ours.py
+  import os
+  import uvicorn
+  from laya import Router
+  from laya.serve import create_app
+
+  router = Router(
+      models={"english": "/models/our_triage_v1"},   # replaces the english checkpoint
+      device=os.environ.get("LAYA_DEVICE") or None,
+      preload=False,
+  )
+  router.preload(["english", "multilingual"])
+  app = create_app(router)
+
+  if __name__ == "__main__":
+      uvicorn.run(app, host=os.environ.get("LAYA_HOST", "127.0.0.1"),
+                  port=int(os.environ.get("LAYA_PORT", "8000")))
+
+LAYA_API_KEY is still read by create_app, so authentication works the same way. Note that
+LAYA_THREADS is applied only by laya-serve's own startup; in a launcher call
+torch.set_num_threads(n) ourselves.
+
+
+8. Observability with hooks
+---------------------------
+Hooks run inside every call, so monitoring needs no code changes elsewhere (examples in
+examples/hooks/: audit.py, cache.py, redact.py, otel.py; docs/hooks/tracing.md).
+
+What to record per request (advice): run_id, model (checkpoint), routing reason, elapsed_ms,
+usage.input_tokens, the decision and answer_confidence per question. Not the raw text,
+unless policy allows.
+
+  import logging
+  from laya import Router
+  from laya.hooks import BaseHook
+
+  log = logging.getLogger("laya")
+
+  class Monitor(BaseHook):
+      def on_load(self, ctx):
+          # the real device: the Agent may have fallen back to CPU
+          log.info("loaded %s on %s", ctx.model, getattr(ctx.agent, "device", "?"))
+      def on_predict_end(self, ctx):
+          for res in ctx.results or []:
+              conf = {q: a.get("answer_confidence") for q, a in res.get("answers", {}).items()}
+              log.info("run=%s model=%s ms=%.1f conf=%s", ctx.run_id, ctx.model,
+                       ctx.elapsed_ms or 0.0, conf)
+      def on_error(self, ctx):
+          log.error("run=%s model=%s error=%r", ctx.run_id, ctx.model, ctx.error)
+
+  router = Router(hooks=[Monitor()], hooks_raise=False, preload=True)
+
+Alerts to set up (advice):
+  - Device fallback. If the GPU fails at load or runs out of memory during inference, Laya
+    moves to CPU and only print()s a warning; requests become 10 to 15 times slower. /health
+    shows the CONFIGURED device, not the real one. Alert on latency and log Agent.device.
+  - Latency p95 and queue time (one request at a time per replica).
+  - Share of answers below the gating threshold (sent to humans): a jump often means the
+    input changed.
+  - Routing mix (english vs multilingual): a jump means traffic changed language.
+  - Calibration drift: monthly labelled sample, ECE on answer_confidence.
+
+
+9. Privacy: redact before inference
+-----------------------------------
+A start hook can rewrite the state before the model sees it (examples/hooks/redact.py).
+Use it if logs or downstream hooks might store text. The model runs locally either way, so
+redaction is about what we persist, not about the model (advice: test that redaction does
+not remove the words the decision depends on).
+
+
+10. Offline and air-gapped hosts
+--------------------------------
+  - Download the checkpoints once on a connected machine into HF_HOME (or copy a model
+    folder), move it over, set HF_HUB_OFFLINE=1.
+  - Or use local folders: laya.load("/models/english") / Router(models={...}).
+  - Routing itself never needs the network.
+
+
+11. NixOS
+---------
+  nix run .#laya-serve          # build and serve (prebuilt CUDA torch)
+  NixOS module options (nix/laya-serve.nix), with defaults:
+    services.laya-serve.enable
+    host              "127.0.0.1"
+    port              8000
+    device            "cuda"
+    models            [ "english" "multilingual" "typed-decisions" ]
+    preload           true
+    threads           null
+    autoTaskDetection false
+    apiKeyFile        null
+    openFirewall      false
+    stateDirectory    "laya-serve" (weight cache under /var/lib)
+
+
+12. Upgrades and rollback
+-------------------------
+  - Pin versions: laya==0.3.20 (or the tested version), and the PyTorch build.
+  - Pin the model: copy the checkpoint folder we evaluated, or pin a Hub revision; do not
+    let "latest" change under us (advice).
+  - Before upgrading laya or a checkpoint, rerun the evaluation plan's test split and
+    compare; release only if the numbers hold.
+  - Keep the previous image and model folder for instant rollback.
+
+
+13. Production checklist
+------------------------
+  [ ] Questions frozen and evaluated ("laya evaluation plan.txt"); thresholds chosen on
+      answer_confidence.
+  [ ] Temperatures fitted on our data (or fine-tuned model with held-out calibration).
+  [ ] LAYA_API_KEY set; bound to localhost or a private network; TLS at the proxy.
+  [ ] LAYA_PRELOAD=1 and LAYA_MODELS set; /health checked by the orchestrator.
+  [ ] Enough replicas for peak load (one request at a time each); LAYA_THREADS sized.
+  [ ] Hooks logging run_id, model, latency, confidence; device logged on load.
+  [ ] Alerts: latency, CPU fallback, low-confidence share, routing mix.
+  [ ] Versions and model folder pinned; rollback tested.
+  [ ] Monthly labelled sample to watch accuracy and calibration drift.
