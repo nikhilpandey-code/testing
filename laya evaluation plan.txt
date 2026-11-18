@@ -10,6 +10,23 @@ hey all good??
 
 
 holaaaaa ?
+okay got it
+heyy nikhil this side your ai enginner having the knowledge of all kind of ai engineers
+
+0. Laya in short
+----------------
+Laya is a decision model: a transformer encoder with a small decision head on top. We give
+it a state (text, JSON or a conversation) and a set of typed questions:
+  - choice   pick one option from a list (e.g. department)
+  - score    pick a level on a scale (e.g. urgency 0-3)
+  - noul     yes or no (e.g. refund requested?)
+In one forward pass it returns a probability for every option. It does not generate text,
+so there is nothing to parse. There are three checkpoints (english, multilingual,
+typed-decisions), and the Router picks one for each request, mainly by language, and
+returns the reason. It runs on our own hardware, so the data stays with us. The
+answer_confidence field is the number we put a threshold on before letting Laya act on its
+own. As shipped it is weak on new business workflows, and fine-tuning is where most of the
+gain comes from. This plan checks how well it works on our own workflow.
 
 1. The questions this plan answers
 ----------------------------------
